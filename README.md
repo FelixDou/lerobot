@@ -102,6 +102,21 @@
 
 LeRobot works with Python 3.10+ and PyTorch 2.2+.
 
+## Local Additions (Subtask Tools)
+
+This fork includes a decoupled subtask pipeline for PI05 evaluations:
+
+- Export frames + task text during eval, then run an external VLM offline.
+- Generate subtasks with Qwen‑VL models using stored frames (no VLA rerun).
+- Annotate videos with per‑frame subtask overlays.
+- Organize eval outputs and logs into consistent folders.
+
+Key scripts:
+- `examples/subtasks/run_decoupled_subtasks.sh`
+- `examples/subtasks/generate_subtasks_offline.py`
+- `examples/subtasks/annotate_videos_with_subtasks.py`
+- `examples/subtasks/organize_run_outputs.py`
+
 ### Environment Setup
 
 Create a virtual environment with Python 3.10 and activate it, e.g. with [`miniforge`](https://conda-forge.org/download/):
