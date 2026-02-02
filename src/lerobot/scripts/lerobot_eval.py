@@ -81,7 +81,7 @@ from lerobot.envs.utils import (
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import PolicyAction, PolicyProcessorPipeline
-from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.io_utils import write_video
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.utils import (
@@ -89,6 +89,42 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+
+def _tensor_to_pil_image(image: Tensor):
+    from PIL import Image
+
+    image = image.detach().float().clamp(0, 1).mul(255).to(torch.uint8).cpu()
+    return Image.fromarray(image.permute(1, 2, 0).numpy())
+
+
+def _save_subtask_inputs_step(
+    *,
+    subtask_inputs_dir: Path,
+    episode_index: int,
+    step: int,
+    image_tensors: dict[str, Tensor],
+    task_text: str,
+    records: list[dict[str, Any]],
+) -> None:
+    episode_dir = subtask_inputs_dir / f"episode_{episode_index:04d}"
+    frame_dir = episode_dir / f"step_{step:05d}"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+
+    image_paths: dict[str, str] = {}
+    for key, tensor in image_tensors.items():
+        filename = f"{key.replace('.', '_')}.png"
+        img_path = frame_dir / filename
+        _tensor_to_pil_image(tensor).save(img_path)
+        image_paths[key] = str(img_path.relative_to(subtask_inputs_dir))
+
+    records.append(
+        {
+            "step": step,
+            "task": task_text,
+            "images": image_paths,
+        }
+    )
 
 
 def rollout(
@@ -99,6 +135,13 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    return_subtasks: bool = False,
+    export_subtask_inputs: bool = False,
+    subtask_inputs_dir: Path | None = None,
+    subtask_inputs_stride: int = 1,
+    episode_offset: int = 0,
+    subtask_max_new_tokens: int = 16,
+    subtask_temperature: float = 0.0,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -144,6 +187,8 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
+    all_subtasks: list[list[str]] = []
+    all_subtask_inputs: list[list[dict[str, Any]]] = [[] for _ in range(env.num_envs)]
 
     step = 0
     # Keep track of which environments are done.
@@ -165,7 +210,49 @@ def rollout(
         # Infer "task" from attributes of environments.
         # TODO: works with SyncVectorEnv but not AsyncVectorEnv
         observation = add_envs_task(env, observation)
+        raw_tasks = observation.get("task")
+
+        if export_subtask_inputs and subtask_inputs_dir is not None and step % subtask_inputs_stride == 0:
+            image_tensors = {
+                key: value
+                for key, value in observation.items()
+                if key == OBS_IMAGE or key.startswith(f"{OBS_IMAGES}.")
+            }
+            if image_tensors:
+                for env_ix in range(env.num_envs):
+                    if done[env_ix]:
+                        continue
+                    episode_index = episode_offset + env_ix
+                    task_text = (
+                        raw_tasks[env_ix] if isinstance(raw_tasks, list) and env_ix < len(raw_tasks) else ""
+                    )
+                    per_env_images = {k: v[env_ix] for k, v in image_tensors.items()}
+                    _save_subtask_inputs_step(
+                        subtask_inputs_dir=subtask_inputs_dir,
+                        episode_index=episode_index,
+                        step=step,
+                        image_tensors=per_env_images,
+                        task_text=task_text,
+                        records=all_subtask_inputs[env_ix],
+                    )
+
         observation = preprocessor(observation)
+        if return_subtasks and hasattr(policy, "generate_subtask"):
+            if hasattr(policy, "should_update_subtask") and not policy.should_update_subtask():
+                subtasks_step = ["" for _ in range(env.num_envs)]
+                all_subtasks.append(subtasks_step)
+            else:
+                try:
+                    subtasks_step = policy.generate_subtask(
+                        observation,
+                        max_new_tokens=subtask_max_new_tokens,
+                        temperature=subtask_temperature,
+                        raw_tasks=raw_tasks,
+                    )
+                except Exception as exc:
+                    logging.warning("Failed to generate subtasks: %s", exc)
+                    subtasks_step = ["" for _ in range(env.num_envs)]
+                all_subtasks.append(subtasks_step)
         with torch.inference_mode():
             action = policy.select_action(observation)
         action = postprocessor(action)
@@ -229,6 +316,13 @@ def rollout(
         for key in all_observations[0]:
             stacked_observations[key] = torch.stack([obs[key] for obs in all_observations], dim=1)
         ret[OBS_STR] = stacked_observations
+    if return_subtasks:
+        if all_subtasks:
+            ret["subtask"] = [list(step) for step in zip(*all_subtasks, strict=False)]
+        else:
+            ret["subtask"] = [[] for _ in range(env.num_envs)]
+    if export_subtask_inputs and subtask_inputs_dir is not None:
+        ret["subtask_inputs"] = all_subtask_inputs
 
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
@@ -246,6 +340,12 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    return_subtasks: bool = False,
+    export_subtask_inputs: bool = False,
+    subtask_inputs_dir: Path | None = None,
+    subtask_inputs_stride: int = 1,
+    subtask_max_new_tokens: int = 16,
+    subtask_temperature: float = 0.0,
 ) -> dict:
     """
     Args:
@@ -281,6 +381,7 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_subtasks: list[list[str]] = []
     threads = []  # for video saving threads
     n_episodes_rendered = 0  # for saving the correct number of videos
 
@@ -324,6 +425,13 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            return_subtasks=return_subtasks,
+            export_subtask_inputs=export_subtask_inputs,
+            subtask_inputs_dir=subtask_inputs_dir,
+            subtask_inputs_stride=subtask_inputs_stride,
+            episode_offset=batch_ix * env.num_envs,
+            subtask_max_new_tokens=subtask_max_new_tokens,
+            subtask_temperature=subtask_temperature,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -346,6 +454,26 @@ def eval_policy(
             all_seeds.extend(seeds)
         else:
             all_seeds.append(None)
+
+        if return_subtasks and "subtask" in rollout_data:
+            for ep_ix, subtask_seq in enumerate(rollout_data["subtask"]):
+                done_index = done_indices[ep_ix].item()
+                all_subtasks.append(subtask_seq[: done_index + 1])
+
+        if export_subtask_inputs and subtask_inputs_dir is not None:
+            subtask_inputs_dir.mkdir(parents=True, exist_ok=True)
+            for ep_ix, frame_records in enumerate(rollout_data.get("subtask_inputs", [])):
+                done_index = done_indices[ep_ix].item()
+                trimmed = [record for record in frame_records if record["step"] <= done_index]
+                episode_index = batch_ix * env.num_envs + ep_ix
+                payload = {
+                    "episode_index": episode_index,
+                    "task": trimmed[0]["task"] if trimmed else "",
+                    "frames": trimmed,
+                }
+                output_path = subtask_inputs_dir / f"episode_{episode_index:04d}.json"
+                with open(output_path, "w") as f:
+                    json.dump(payload, f, indent=2)
 
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
@@ -398,25 +526,29 @@ def eval_policy(
         thread.join()
 
     # Compile eval info.
+    per_episode = []
+    for i, (sum_reward, max_reward, success, seed) in enumerate(
+        zip(
+            sum_rewards[:n_episodes],
+            max_rewards[:n_episodes],
+            all_successes[:n_episodes],
+            all_seeds[:n_episodes],
+            strict=True,
+        )
+    ):
+        entry = {
+            "episode_ix": i,
+            "sum_reward": sum_reward,
+            "max_reward": max_reward,
+            "success": success,
+            "seed": seed,
+        }
+        if return_subtasks:
+            entry["subtasks"] = all_subtasks[i]
+        per_episode.append(entry)
+
     info = {
-        "per_episode": [
-            {
-                "episode_ix": i,
-                "sum_reward": sum_reward,
-                "max_reward": max_reward,
-                "success": success,
-                "seed": seed,
-            }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
-                zip(
-                    sum_rewards[:n_episodes],
-                    max_rewards[:n_episodes],
-                    all_successes[:n_episodes],
-                    all_seeds[:n_episodes],
-                    strict=True,
-                )
-            )
-        ],
+        "per_episode": per_episode,
         "aggregated": {
             "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
             "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
@@ -518,6 +650,17 @@ def eval_main(cfg: EvalPipelineConfig):
         preprocessor_overrides=preprocessor_overrides,
     )
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
+        # Determine suite name(s) for video directory naming
+        suite_names = list(envs.keys()) if isinstance(envs, dict) else []
+        if suite_names:
+            videos_dir_name = f"videos_{'_'.join(suite_names)}"
+        else:
+            videos_dir_name = "videos"
+        
+        subtasks_dir = Path(cfg.output_dir) / "subtasks" if cfg.eval.log_subtasks else None
+        subtask_inputs_dir = (
+            Path(cfg.output_dir) / "subtask_inputs" if cfg.eval.export_subtask_inputs else None
+        )
         info = eval_policy_all(
             envs=envs,
             policy=policy,
@@ -525,9 +668,16 @@ def eval_main(cfg: EvalPipelineConfig):
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
             max_episodes_rendered=10,
-            videos_dir=Path(cfg.output_dir) / "videos",
+            videos_dir=Path(cfg.output_dir) / videos_dir_name,
+            subtasks_dir=subtasks_dir,
+            subtask_inputs_dir=subtask_inputs_dir,
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            return_subtasks=cfg.eval.log_subtasks,
+            export_subtask_inputs=cfg.eval.export_subtask_inputs,
+            subtask_inputs_stride=cfg.eval.subtask_inputs_stride,
+            subtask_max_new_tokens=cfg.eval.subtask_max_new_tokens,
+            subtask_temperature=cfg.eval.subtask_temperature,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -539,19 +689,29 @@ def eval_main(cfg: EvalPipelineConfig):
     # Close all vec envs
     close_envs(envs)
 
-    # Save info
-    with open(Path(cfg.output_dir) / "eval_info.json", "w") as f:
+    # Save info - include suite name in filename to avoid overwriting previous evaluations
+    suite_names = list(info.keys())
+    suite_names = [s for s in suite_names if s != "overall"]  # Remove "overall" key
+    if suite_names:
+        # Use the first suite name (or all if multiple, joined with underscore)
+        suite_suffix = "_".join(suite_names)
+        eval_info_filename = f"eval_info_{suite_suffix}.json"
+    else:
+        eval_info_filename = "eval_info.json"
+    
+    with open(Path(cfg.output_dir) / eval_info_filename, "w") as f:
         json.dump(info, f, indent=2)
 
     logging.info("End of eval")
 
 
 # ---- typed payload returned by one task eval ----
-class TaskMetrics(TypedDict):
+class TaskMetrics(TypedDict, total=False):
     sum_rewards: list[float]
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    subtasks: list[list[str]]
 
 
 ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
@@ -568,6 +728,12 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    return_subtasks: bool,
+    export_subtask_inputs: bool,
+    subtask_inputs_dir: Path | None,
+    subtask_inputs_stride: int,
+    subtask_max_new_tokens: int,
+    subtask_temperature: float,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -583,15 +749,40 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        return_subtasks=return_subtasks,
+        export_subtask_inputs=export_subtask_inputs,
+        subtask_inputs_dir=subtask_inputs_dir,
+        subtask_inputs_stride=subtask_inputs_stride,
+        subtask_max_new_tokens=subtask_max_new_tokens,
+        subtask_temperature=subtask_temperature,
     )
 
     per_episode = task_result["per_episode"]
-    return TaskMetrics(
+    metrics = TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
     )
+    if return_subtasks:
+        metrics["subtasks"] = [ep["subtasks"] for ep in per_episode]
+    return metrics
+
+
+def _sanitize_task_description(task_desc: str, max_length: int = 200) -> str:
+    """Sanitize task description for use in filesystem paths."""
+    import re
+    # Remove newlines and extra whitespace
+    sanitized = ' '.join(task_desc.split())
+    # Replace spaces and special characters with underscores, keep alphanumeric and hyphens
+    sanitized = re.sub(r'[^\w\s-]', '', sanitized)
+    sanitized = re.sub(r'[-\s]+', '_', sanitized)
+    # Remove leading/trailing underscores and limit length (200 chars should be enough for most tasks)
+    sanitized = sanitized.strip('_')[:max_length]
+    # Ensure it's not empty
+    if not sanitized:
+        sanitized = "task"
+    return sanitized
 
 
 def run_one(
@@ -605,8 +796,15 @@ def run_one(
     n_episodes: int,
     max_episodes_rendered: int,
     videos_dir: Path | None,
+    subtasks_dir: Path | None,
+    subtask_inputs_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    return_subtasks: bool,
+    export_subtask_inputs: bool,
+    subtask_inputs_stride: int,
+    subtask_max_new_tokens: int,
+    subtask_temperature: float,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -614,9 +812,45 @@ def run_one(
     This function is intentionally module-level to make it easy to test.
     """
     task_videos_dir = None
+    task_desc = None
     if videos_dir is not None:
-        task_videos_dir = videos_dir / f"{task_group}_{task_id}"
+        # Get task description from environment if available
+        task_desc_suffix = ""
+        try:
+            if hasattr(env, 'call'):
+                # Use the call method to get task_description (works for VectorEnv)
+                task_result = env.call("task_description")
+                if task_result and len(task_result) > 0:
+                    task_desc = task_result[0] if isinstance(task_result, (list, tuple)) else task_result
+                    if task_desc and isinstance(task_desc, str):
+                        sanitized_desc = _sanitize_task_description(task_desc)
+                        task_desc_suffix = f"_{sanitized_desc}"
+        except (AttributeError, IndexError, TypeError):
+            # Fallback: try direct access
+            if hasattr(env, 'envs') and len(env.envs) > 0:
+                first_env = env.envs[0]
+                if hasattr(first_env, 'task_description'):
+                    task_desc = first_env.task_description
+                    if task_desc:
+                        sanitized_desc = _sanitize_task_description(task_desc)
+                        task_desc_suffix = f"_{sanitized_desc}"
+        
+        task_videos_dir = videos_dir / f"{task_group}_{task_id}{task_desc_suffix}"
         task_videos_dir.mkdir(parents=True, exist_ok=True)
+
+    task_subtask_inputs_dir = None
+    if export_subtask_inputs and subtask_inputs_dir is not None:
+        task_desc_suffix = f"_{_sanitize_task_description(task_desc)}" if task_desc else ""
+        task_subtask_inputs_dir = subtask_inputs_dir / f"{task_group}_{task_id}{task_desc_suffix}"
+        task_subtask_inputs_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path = task_subtask_inputs_dir / "metadata.json"
+        metadata = {
+            "task_group": task_group,
+            "task_id": task_id,
+            "task_description": task_desc,
+        }
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
     # Call the existing eval_one (assumed to return TaskMetrics-like dict)
     metrics = eval_one(
@@ -629,10 +863,29 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        return_subtasks=return_subtasks,
+        export_subtask_inputs=export_subtask_inputs,
+        subtask_inputs_dir=task_subtask_inputs_dir,
+        subtask_inputs_stride=subtask_inputs_stride,
+        subtask_max_new_tokens=subtask_max_new_tokens,
+        subtask_temperature=subtask_temperature,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
         metrics.setdefault("video_paths", [])
+
+    if return_subtasks and subtasks_dir is not None:
+        subtasks_dir.mkdir(parents=True, exist_ok=True)
+        task_desc_suffix = f"_{_sanitize_task_description(task_desc)}" if task_desc else ""
+        subtasks_path = subtasks_dir / f"{task_group}_{task_id}{task_desc_suffix}_subtasks.json"
+        payload = {
+            "task_group": task_group,
+            "task_id": task_id,
+            "task_description": task_desc,
+            "subtasks": metrics.get("subtasks", []),
+        }
+        with open(subtasks_path, "w") as f:
+            json.dump(payload, f, indent=2)
     return task_group, task_id, metrics
 
 
@@ -645,9 +898,16 @@ def eval_policy_all(
     *,
     max_episodes_rendered: int = 0,
     videos_dir: Path | None = None,
+    subtasks_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    return_subtasks: bool = False,
+    export_subtask_inputs: bool = False,
+    subtask_inputs_dir: Path | None = None,
+    subtask_inputs_stride: int = 1,
+    subtask_max_new_tokens: int = 16,
+    subtask_temperature: float = 0.0,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -699,8 +959,15 @@ def eval_policy_all(
         n_episodes=n_episodes,
         max_episodes_rendered=max_episodes_rendered,
         videos_dir=videos_dir,
+        subtasks_dir=subtasks_dir,
+        subtask_inputs_dir=subtask_inputs_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        return_subtasks=return_subtasks,
+        export_subtask_inputs=export_subtask_inputs,
+        subtask_inputs_stride=subtask_inputs_stride,
+        subtask_max_new_tokens=subtask_max_new_tokens,
+        subtask_temperature=subtask_temperature,
     )
 
     if max_parallel_tasks <= 1:

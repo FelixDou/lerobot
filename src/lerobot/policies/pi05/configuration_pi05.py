@@ -51,7 +51,13 @@ class PI05Config(PreTrainedConfig):
     # Add empty images. Used to add empty cameras when no image features are present.
     empty_cameras: int = 0
 
+    tokenizer_name: str = "google/paligemma-3b-pt-224"
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
+
+    # External VLM for subtask text generation (optional).
+    subtask_vlm_name: str | None = "Qwen/Qwen3-VL-4B-Instruct"
+    subtask_vlm_dtype: str = "bfloat16"
+    subtask_vlm_trust_remote_code: bool = True
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {

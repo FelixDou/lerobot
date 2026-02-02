@@ -18,6 +18,7 @@ import builtins
 import logging
 import math
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -29,11 +30,20 @@ from lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
+    from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+    try:
+        from transformers import AutoModelForVision2Seq
+    except ImportError:  # Older transformers
+        AutoModelForVision2Seq = None
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
     from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
     from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 else:
+    AutoModelForCausalLM = None
+    AutoModelForVision2Seq = None
+    AutoProcessor = None
+    AutoTokenizer = None
     CONFIG_MAPPING = None
     modeling_gemma = None
     GemmaForCausalLM = None
@@ -847,6 +857,11 @@ class PI05Policy(PreTrainedPolicy):
 
         self.model.to(config.device)
 
+        self._tokenizer = None
+        self._subtask_vlm = None
+        self._subtask_processor = None
+        self._last_subtasks = None
+
         self.reset()
 
     @classmethod
@@ -1034,6 +1049,433 @@ class PI05Policy(PreTrainedPolicy):
         self._queues = {
             ACTION: deque(maxlen=self.config.n_action_steps),
         }
+        self._last_subtasks = None
+
+    def should_update_subtask(self) -> bool:
+        """Return True when a new action chunk is about to be computed."""
+        return len(self._action_queue) == 0
+
+    def _get_tokenizer(self):
+        if self._tokenizer is None:
+            if not _transformers_available or AutoTokenizer is None:
+                raise ImportError(
+                    "The 'transformers' library is required to generate subtasks. "
+                    "Install it with `pip install 'lerobot[transformers-dep]'`."
+                )
+            self._tokenizer = AutoTokenizer.from_pretrained(self.config.tokenizer_name)
+            # Decoder-only generation expects left padding.
+            self._tokenizer.padding_side = "left"
+        return self._tokenizer
+
+    def _get_subtask_vlm(self):
+        if self._subtask_vlm is None:
+            if not _transformers_available or AutoProcessor is None:
+                raise ImportError(
+                    "The 'transformers' library is required to generate subtasks. "
+                    "Install it with `pip install 'lerobot[transformers-dep]'`."
+                )
+            if self.config.subtask_vlm_name is None:
+                raise ValueError("subtask_vlm_name is not configured")
+
+            device = next(self.parameters()).device
+            target_dtype = (
+                torch.bfloat16 if self.config.subtask_vlm_dtype == "bfloat16" else torch.float32
+            )
+            target_dtype = get_safe_dtype(target_dtype, device.type)
+
+            self._subtask_processor = AutoProcessor.from_pretrained(
+                self.config.subtask_vlm_name,
+                trust_remote_code=self.config.subtask_vlm_trust_remote_code,
+            )
+            if hasattr(self._subtask_processor, "tokenizer") and self._subtask_processor.tokenizer is not None:
+                self._subtask_processor.tokenizer.padding_side = "left"
+            self._subtask_vlm = None
+            if AutoModelForVision2Seq is not None:
+                try:
+                    self._subtask_vlm = AutoModelForVision2Seq.from_pretrained(
+                        self.config.subtask_vlm_name,
+                        torch_dtype=target_dtype,
+                        trust_remote_code=self.config.subtask_vlm_trust_remote_code,
+                    )
+                except ValueError:
+                    self._subtask_vlm = None
+            if self._subtask_vlm is None:
+                if AutoModelForCausalLM is None:
+                    raise ImportError("AutoModelForCausalLM is not available in transformers")
+                self._subtask_vlm = AutoModelForCausalLM.from_pretrained(
+                    self.config.subtask_vlm_name,
+                    torch_dtype=target_dtype,
+                    trust_remote_code=self.config.subtask_vlm_trust_remote_code,
+                    attn_implementation="eager",
+                )
+            # Ensure FlashAttention2 is not required.
+            if hasattr(self._subtask_vlm, "config"):
+                self._subtask_vlm.config.attn_implementation = "eager"
+                for attr in (
+                    "use_flash_attention_2",
+                    "flash_attention_2",
+                    "flash_attn",
+                    "use_flash_attn",
+                ):
+                    if hasattr(self._subtask_vlm.config, attr):
+                        setattr(self._subtask_vlm.config, attr, False)
+            self._subtask_vlm.to(device)
+            self._subtask_vlm.eval()
+
+        return self._subtask_vlm, self._subtask_processor
+
+    def _left_pad_tokens(
+        self, tokens: Tensor, masks: Tensor, pad_token_id: int
+    ) -> tuple[Tensor, Tensor]:
+        """Convert right-padded tokens/masks to left-padded for generation."""
+        if tokens.shape != masks.shape:
+            raise ValueError("tokens and masks must have the same shape for left padding")
+        if masks.dtype != torch.long:
+            masks = masks.to(dtype=torch.long)
+
+        batch_size, seq_len = tokens.shape
+        padded_tokens = torch.full_like(tokens, pad_token_id)
+        padded_masks = torch.zeros_like(masks)
+
+        for i in range(batch_size):
+            valid = int(masks[i].sum().item())
+            if valid == 0:
+                continue
+            start = seq_len - valid
+            padded_tokens[i, start:] = tokens[i, :valid]
+            padded_masks[i, start:] = 1
+
+        return padded_tokens, padded_masks
+
+    @torch.no_grad()
+    def generate_subtask(
+        self,
+        batch: dict[str, Tensor],
+        max_new_tokens: int = 16,
+        temperature: float = 0.0,
+        raw_tasks: list[str] | None = None,
+    ) -> list[str]:
+        """Generate a short subtask description from the PI05 language model."""
+        self.eval()
+
+        # Prepare multimodal inputs for the VLM.
+        images, _ = self._preprocess_images(batch)
+        tokens = batch[OBS_LANGUAGE_TOKENS]
+        masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
+
+        if self.config.subtask_vlm_name is not None:
+            prev_subtasks = self._last_subtasks
+            if prev_subtasks is None:
+                prev_subtasks = ["" for _ in range(tokens.shape[0])]
+            outputs = self._generate_subtask_with_external_vlm(
+                batch=batch,
+                raw_tasks=raw_tasks,
+                prev_subtasks=prev_subtasks,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+            )
+            self._last_subtasks = outputs
+            return outputs
+
+        tokenizer = self._get_tokenizer()
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        eos_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else pad_token_id
+        tokens, masks = self._left_pad_tokens(tokens, masks, pad_token_id)
+
+        if raw_tasks is None:
+            # Fallback: recover task text from the tokenized prompt.
+            raw_tasks = []
+            for i in range(tokens.shape[0]):
+                valid = int(masks[i].sum().item())
+                token_slice = tokens[i, -valid:] if valid > 0 else tokens[i]
+                text = tokenizer.decode(token_slice, skip_special_tokens=True)
+                task_text = text
+                if "Task:" in text and ", State:" in text:
+                    task_text = text.split("Task:", 1)[1].split(", State:", 1)[0]
+                raw_tasks.append(task_text.strip())
+
+        prompt_texts = []
+        for task in raw_tasks:
+            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+            prompt_texts.append(
+                "<image>\n"
+                "You are a robot. Given the task, describe the next low-level "
+                "subtask in 3-8 words. Reply with only the subtask.\n"
+                f"Task: {cleaned_text}\n"
+                "Subtask:"
+            )
+
+        prompt_tokens = tokenizer(
+            prompt_texts,
+            max_length=self.config.tokenizer_max_length,
+            truncation=True,
+            padding="max_length",
+            padding_side="left",
+            return_tensors="pt",
+        )
+        tokens = prompt_tokens["input_ids"].to(device=tokens.device)
+        masks = prompt_tokens["attention_mask"].to(device=masks.device, dtype=masks.dtype)
+
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": pad_token_id,
+            "min_new_tokens": 1,
+            "do_sample": temperature > 0,
+        }
+        if temperature > 0:
+            gen_kwargs["temperature"] = temperature
+            gen_kwargs["top_p"] = 0.9
+
+        # PaliGemma only supports a single image input; use the first camera.
+        pixel_values = images[0]
+
+        # PaliGemma expects image placeholder tokens in the text prompt.
+        # The number of tokens must match the image embeddings length.
+        with torch.no_grad():
+            img_emb = self.model.paligemma_with_expert.embed_image(pixel_values)
+        num_image_tokens = img_emb.shape[1]
+        image_token_index = self.model.paligemma_with_expert.paligemma.config.image_token_index
+        image_tokens = torch.full(
+            (tokens.shape[0], num_image_tokens),
+            image_token_index,
+            device=tokens.device,
+            dtype=tokens.dtype,
+        )
+        image_masks = torch.ones(
+            (tokens.shape[0], num_image_tokens),
+            device=masks.device,
+            dtype=masks.dtype,
+        )
+        full_input_ids = torch.cat([image_tokens, tokens], dim=1)
+        full_attention_mask = torch.cat([image_masks, masks], dim=1)
+
+        image_token_id = getattr(tokenizer, "image_token_id", image_token_index)
+        vocab_size = None
+        if hasattr(self.model.paligemma_with_expert.paligemma.config, "text_config"):
+            vocab_size = self.model.paligemma_with_expert.paligemma.config.text_config.vocab_size
+        else:
+            vocab_size = getattr(self.model.paligemma_with_expert.paligemma.config, "vocab_size", None)
+        # Avoid logits processors that assume token IDs are < vocab_size when image tokens use a sentinel ID.
+        if vocab_size is not None and image_token_index < vocab_size:
+            gen_kwargs.setdefault("repetition_penalty", 1.1)
+            gen_kwargs.setdefault("no_repeat_ngram_size", 3)
+        gen_kwargs.setdefault("eos_token_id", eos_token_id)
+
+        # Force eager attention to avoid SDPA bias dtype mismatches.
+        self.model.paligemma_with_expert.paligemma.config._attn_implementation = "eager"  # noqa: SLF001
+        device_type = pixel_values.device.type
+        sdp_ctx = nullcontext()
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+            sdp_ctx = torch.backends.cuda.sdp_kernel(
+                enable_flash=False, enable_mem_efficient=False, enable_math=True
+            )
+        try:
+            with sdp_ctx, torch.autocast(device_type=device_type, enabled=False):
+                generated = self.model.paligemma_with_expert.paligemma.generate(
+                    input_ids=full_input_ids,
+                    attention_mask=full_attention_mask,
+                    pixel_values=pixel_values,
+                    **gen_kwargs,
+                )
+        except Exception as exc:
+            if "invalid dtype for bias" not in str(exc):
+                raise
+            # Fallback: run subtask generation in float32 for dtype safety.
+            paligemma = self.model.paligemma_with_expert.paligemma
+            orig_dtype = next(paligemma.parameters()).dtype
+            try:
+                paligemma.to(dtype=torch.float32)
+                pixel_values_f32 = pixel_values.to(dtype=torch.float32)
+                with sdp_ctx, torch.autocast(device_type=device_type, enabled=False):
+                    generated = paligemma.generate(
+                        input_ids=full_input_ids,
+                        attention_mask=full_attention_mask.to(dtype=torch.float32),
+                        pixel_values=pixel_values_f32,
+                        **gen_kwargs,
+                    )
+            finally:
+                paligemma.to(dtype=orig_dtype)
+
+        subtasks: list[str] = []
+        for i in range(generated.shape[0]):
+            prompt_len = int(full_attention_mask[i].sum().item())
+            gen_ids = generated[i, prompt_len:]
+            gen_ids = gen_ids[gen_ids != image_token_index]
+            if image_token_id != image_token_index:
+                gen_ids = gen_ids[gen_ids != image_token_id]
+            text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            if "Subtask:" in text:
+                text = text.split("Subtask:", 1)[1]
+            text = text.strip()
+            if "\n" in text:
+                text = text.split("\n", 1)[0]
+            if ";" in text:
+                text = text.split(";", 1)[0]
+            text = text.strip()
+            subtasks.append(text)
+
+        return subtasks
+
+    def _generate_subtask_with_external_vlm(
+        self,
+        *,
+        batch: dict[str, Tensor],
+        raw_tasks: list[str] | None,
+        prev_subtasks: list[str],
+        max_new_tokens: int,
+        temperature: float,
+    ) -> list[str]:
+        model, processor = self._get_subtask_vlm()
+
+        if raw_tasks is None:
+            raw_tasks = ["" for _ in range(next(iter(batch.values())).shape[0])]
+
+        prompt_texts = []
+        model_name = self.config.subtask_vlm_name.lower() if self.config.subtask_vlm_name else ""
+        use_qwen_chat = (
+            "qwen3-vl" in model_name or "qwen2-vl" in model_name or "qwen2.5-vl" in model_name
+        )
+        prefix = "<image>\n" if "qwen3-vl" in model_name else ""
+        for task, prev_subtask in zip(raw_tasks, prev_subtasks, strict=False):
+            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+            prev_text = prev_subtask.strip() if prev_subtask else "none"
+            prompt_texts.append(
+                f"{prefix}You are a robot. Given the task and the current image, write the next low-level "
+                "subtask to accomplish the task. Use 3-8 words.\n"
+                "If nothing changed since the previous step, repeat the previous subtask.\n"
+                "If the previous subtask is complete, update it to the next one.\n"
+                "Reply with only the subtask text.\n"
+                "\nExample:\n"
+                "Task: put the red block in the bin\n"
+                "Prev subtask: move to red block\n"
+                "Next subtask: grasp red block\n"
+                "\n"
+                f"Task: {cleaned_text}\n"
+                f"Prev subtask: {prev_text}\n"
+                "Next subtask:"
+            )
+
+        image_key = next(iter(self.config.image_features))
+        images = batch[image_key]
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
+        from PIL import Image
+
+        images_cpu = images.detach().float().clamp(0, 1).mul(255).to(torch.uint8).cpu()
+        pil_images = [
+            Image.fromarray(images_cpu[i].permute(1, 2, 0).numpy())
+            for i in range(images_cpu.shape[0])
+        ]
+
+        def _build_inputs(texts: list[str]):
+            if use_qwen_chat and hasattr(processor, "apply_chat_template"):
+                messages = []
+                for image, text in zip(pil_images, texts, strict=False):
+                    messages.append(
+                        [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "image": image},
+                                    {"type": "text", "text": text},
+                                ],
+                            }
+                        ]
+                    )
+                chat_texts = [
+                    processor.apply_chat_template(
+                        message,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for message in messages
+                ]
+                return processor(
+                    text=chat_texts,
+                    images=pil_images,
+                    padding=True,
+                    return_tensors="pt",
+                )
+            return processor(
+                images=pil_images,
+                text=texts,
+                padding=True,
+                return_tensors="pt",
+            )
+
+        inputs = _build_inputs(prompt_texts)
+        device = next(self.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "min_new_tokens": 1,
+            "do_sample": temperature > 0,
+        }
+        if temperature > 0:
+            gen_kwargs["temperature"] = temperature
+            gen_kwargs["top_p"] = 0.9
+
+        with torch.inference_mode():
+            sdp_ctx = nullcontext()
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+                sdp_ctx = torch.backends.cuda.sdp_kernel(
+                    enable_flash=False, enable_mem_efficient=False, enable_math=True
+                )
+            with sdp_ctx:
+                generated = model.generate(**inputs, **gen_kwargs)
+
+        input_len = inputs["input_ids"].shape[1]
+        outputs = []
+        for i in range(generated.shape[0]):
+            gen_ids = generated[i, input_len:]
+            text = processor.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            text = text.strip().split("\n", 1)[0].split(";", 1)[0].strip()
+            outputs.append(text)
+
+        # Second stage: check completion. If not complete, keep previous subtask.
+        completion_prompts = []
+        for task, prev_subtask in zip(raw_tasks, prev_subtasks, strict=False):
+            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+            prev_text = prev_subtask.strip() if prev_subtask else "none"
+            completion_prompts.append(
+                f"{prefix}You are a robot. Look at the current image and decide if the previous subtask is completed.\n"
+                "Reply with only one word: yes or no.\n"
+                f"Task: {cleaned_text}\n"
+                f"Prev subtask: {prev_text}\n"
+                "Completed:"
+            )
+
+        completion_inputs = _build_inputs(completion_prompts)
+        completion_inputs = {k: v.to(device) for k, v in completion_inputs.items()}
+        completion_kwargs = {"max_new_tokens": 3, "min_new_tokens": 1, "do_sample": False}
+        with torch.inference_mode():
+            sdp_ctx = nullcontext()
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+                sdp_ctx = torch.backends.cuda.sdp_kernel(
+                    enable_flash=False, enable_mem_efficient=False, enable_math=True
+                )
+            with sdp_ctx:
+                completed_ids = model.generate(**completion_inputs, **completion_kwargs)
+
+        completion_input_len = completion_inputs["input_ids"].shape[1]
+        completion_texts: list[str] = []
+        for i in range(completed_ids.shape[0]):
+            gen_ids = completed_ids[i, completion_input_len:]
+            text = processor.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            completion_texts.append(text.strip().split()[0].lower())
+
+        final_outputs = []
+        for i, candidate in enumerate(outputs):
+            prev = prev_subtasks[i].strip() if i < len(prev_subtasks) and prev_subtasks[i] else ""
+            completed = i < len(completion_texts) and completion_texts[i].startswith("y")
+            if prev and not completed:
+                final_outputs.append(prev)
+            else:
+                final_outputs.append(candidate)
+
+        return final_outputs
 
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.

@@ -56,6 +56,16 @@ class EvalConfig:
     batch_size: int = 50
     # `use_async_envs` specifies whether to use asynchronous environments (multiprocessing).
     use_async_envs: bool = False
+    # Whether to extract PI05 subtasks during evaluation.
+    log_subtasks: bool = False
+    # Whether to export frames + task text for offline subtask generation.
+    export_subtask_inputs: bool = False
+    # Save every N frames when exporting subtask inputs.
+    subtask_inputs_stride: int = 1
+    # Max tokens to generate for each subtask.
+    subtask_max_new_tokens: int = 16
+    # Temperature for subtask generation (0 = greedy).
+    subtask_temperature: float = 0.0
 
     def __post_init__(self) -> None:
         if self.batch_size > self.n_episodes:
