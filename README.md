@@ -117,6 +117,12 @@ Key scripts:
 - `examples/subtasks/annotate_videos_with_subtasks.py`
 - `examples/subtasks/organize_run_outputs.py`
 
+Output layout (after running `organize_run_outputs.py`):
+- `outputs/eval/<date>/<run>/inputs/subtask_inputs/`
+- `outputs/eval/<date>/<run>/videos/<suite>/`
+- `outputs/eval/<date>/<run>/videos/with_subtasks/`
+- `outputs/eval/<date>/<run>/subtasks/<variant>/`
+
 ### Environment Setup
 
 Create a virtual environment with Python 3.10 and activate it, e.g. with [`miniforge`](https://conda-forge.org/download/):
