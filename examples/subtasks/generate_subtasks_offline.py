@@ -6,12 +6,16 @@ from pathlib import Path
 
 import torch
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoProcessor
+from transformers import AutoProcessor
 
 try:
     from transformers import AutoModelForVision2Seq
 except ImportError:  # Older Transformers
     AutoModelForVision2Seq = None
+try:
+    from transformers import AutoModelForImageTextToText
+except ImportError:  # Older Transformers
+    AutoModelForImageTextToText = None
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -33,6 +37,17 @@ def _strip_thinking(text: str) -> str:
     return text
 
 
+def _extract_tag(text: str, tag: str) -> str | None:
+    lowered = text.lower()
+    open_tag = f"<{tag}>"
+    close_tag = f"</{tag}>"
+    start = lowered.find(open_tag)
+    end = lowered.find(close_tag)
+    if start == -1 or end == -1 or end <= start:
+        return None
+    return text[start + len(open_tag) : end].strip()
+
+
 def _extract_subtask_sentence(text: str) -> str:
     sentences = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
     if not sentences:
@@ -49,6 +64,9 @@ def _extract_subtask_sentence(text: str) -> str:
 def _clean_response(text: str) -> str:
     text = _strip_thinking(text).strip()
     lowered = text.lower()
+    tagged = _extract_tag(text, "subtask")
+    if tagged:
+        return tagged
     if "final:" in lowered:
         text = text[lowered.rfind("final:") + len("final:") :].strip()
     if text.lower().startswith("assistant"):
@@ -71,15 +89,15 @@ def _build_prompt(task: str, prev_subtask: str, *, model_name: str) -> str:
         "Use 3-8 words. Use an imperative verb phrase.\n"
         "If nothing changed since the previous step, repeat the previous subtask.\n"
         "If the previous subtask is complete, update it to the next one.\n"
-        "Do not restate the task. Output only the subtask text.\n"
+        "Do not restate the task. Output only the subtask in this XML tag: <subtask>...</subtask>.\n"
         "\nExample:\n"
         "Task: put the red block in the bin\n"
         "Prev subtask: move to red block\n"
-        "Next subtask: grasp red block\n"
+        "Next subtask: <subtask>grasp red block</subtask>\n"
         "\n"
         f"Task: {cleaned_text}\n"
         f"Prev subtask: {prev_text}\n"
-        "Next subtask:"
+        "Next subtask: <subtask>"
     )
 
 
@@ -248,13 +266,19 @@ def main() -> None:
     model_name = args.model
     max_new_tokens = None if args.no_max_new_tokens else args.max_new_tokens
     clean_output = not args.no_clean_output
-    if AutoModelForVision2Seq is not None:
+    if AutoModelForImageTextToText is not None:
+        model = AutoModelForImageTextToText.from_pretrained(
+            model_name, torch_dtype=torch_dtype, trust_remote_code=True, device_map="auto"
+        )
+    elif AutoModelForVision2Seq is not None:
         model = AutoModelForVision2Seq.from_pretrained(
             model_name, torch_dtype=torch_dtype, trust_remote_code=True, device_map="auto"
         )
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=torch_dtype, trust_remote_code=True, device_map="auto"
+        raise RuntimeError(
+            "Your Transformers version is too old for Qwen3-VL. "
+            "Install a newer Transformers (or from source) that provides "
+            "AutoModelForImageTextToText or AutoModelForVision2Seq."
         )
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
