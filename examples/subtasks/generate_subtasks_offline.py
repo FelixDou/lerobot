@@ -31,15 +31,37 @@ def _resolve_dtype(name: str) -> torch.dtype:
     return torch.float32
 
 
-def _from_pretrained_compat(model_cls, model_name: str, dtype: torch.dtype):
-    kwargs = {"trust_remote_code": True, "device_map": "auto"}
-    try:
-        # Newer Transformers versions prefer `dtype` over `torch_dtype`.
-        return model_cls.from_pretrained(model_name, dtype=dtype, **kwargs)
-    except TypeError as exc:
-        if "unexpected keyword argument 'dtype'" not in str(exc):
+def _from_pretrained_compat(model_cls, model_name: str, dtype: torch.dtype, **extra_kwargs):
+    # Keep kernels disabled for stability unless explicitly requested.
+    common_kwargs = {"trust_remote_code": True, "device_map": "auto", "use_kernels": False}
+    common_kwargs.update(extra_kwargs)
+
+    # Newer Transformers versions prefer `dtype` over `torch_dtype`.
+    for dtype_kw in ({"dtype": dtype}, {"torch_dtype": dtype}):
+        kwargs = {**common_kwargs, **dtype_kw}
+        try:
+            return model_cls.from_pretrained(model_name, **kwargs)
+        except TypeError as exc:
+            msg = str(exc)
+            if "unexpected keyword argument 'use_kernels'" in msg:
+                kwargs.pop("use_kernels", None)
+                try:
+                    return model_cls.from_pretrained(model_name, **kwargs)
+                except TypeError as inner_exc:
+                    inner_msg = str(inner_exc)
+                    if (
+                        "unexpected keyword argument 'dtype'" in inner_msg
+                        and "dtype" in dtype_kw
+                        and "torch_dtype" not in dtype_kw
+                    ):
+                        continue
+                    raise
+            if "unexpected keyword argument 'dtype'" in msg and "dtype" in dtype_kw and "torch_dtype" not in dtype_kw:
+                continue
             raise
-        return model_cls.from_pretrained(model_name, torch_dtype=dtype, **kwargs)
+
+    # Should never happen, but keep a clear failure mode.
+    raise RuntimeError("Unable to load model with either `dtype` or `torch_dtype` arguments.")
 
 
 def _strip_thinking(text: str) -> str:
