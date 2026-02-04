@@ -2,11 +2,20 @@
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import torch
 from PIL import Image
 from transformers import AutoProcessor
+try:
+    from huggingface_hub import hf_hub_download
+except ImportError:  # Optional fallback for very old envs
+    hf_hub_download = None
+try:
+    from safetensors import safe_open
+except ImportError:  # Optional fallback for very old envs
+    safe_open = None
 
 try:
     from transformers import AutoModelForVision2Seq
@@ -62,6 +71,58 @@ def _from_pretrained_compat(model_cls, model_name: str, dtype: torch.dtype, **ex
 
     # Should never happen, but keep a clear failure mode.
     raise RuntimeError("Unable to load model with either `dtype` or `torch_dtype` arguments.")
+
+
+def _patch_qwen3_vl_30b_moe_weights(model, model_name: str) -> int:
+    """Patch MoE tensors that are transposed in some Transformers/Qwen3-VL combinations."""
+    if hf_hub_download is None or safe_open is None:
+        raise RuntimeError(
+            "Cannot patch Qwen3-VL-30B MoE weights because `huggingface_hub` or `safetensors` is unavailable."
+        )
+
+    index_path = Path(hf_hub_download(repo_id=model_name, filename="model.safetensors.index.json"))
+    with open(index_path, "r") as f:
+        index_payload = json.load(f)
+
+    weight_map = index_payload.get("weight_map", {})
+    candidate_keys = [
+        key
+        for key in weight_map
+        if ".mlp.experts.down_proj" in key or ".mlp.experts.gate_up_proj" in key
+    ]
+
+    params = dict(model.named_parameters())
+    target_keys = [key for key in candidate_keys if key in params]
+    if not target_keys:
+        return 0
+
+    by_shard: dict[str, list[str]] = defaultdict(list)
+    for key in target_keys:
+        by_shard[weight_map[key]].append(key)
+
+    patched = 0
+    with torch.no_grad():
+        for shard_name, keys in by_shard.items():
+            shard_path = hf_hub_download(repo_id=model_name, filename=shard_name)
+            with safe_open(shard_path, framework="pt", device="cpu") as shard:
+                for key in keys:
+                    param = params[key]
+                    ckpt_tensor = shard.get_tensor(key)
+
+                    if tuple(ckpt_tensor.shape) == tuple(param.shape):
+                        fixed_tensor = ckpt_tensor
+                    else:
+                        transposed = ckpt_tensor.transpose(-1, -2).contiguous()
+                        if tuple(transposed.shape) != tuple(param.shape):
+                            raise RuntimeError(
+                                f"Unexpected shape for `{key}`: ckpt={tuple(ckpt_tensor.shape)} "
+                                f"model={tuple(param.shape)}"
+                            )
+                        fixed_tensor = transposed
+
+                    param.data.copy_(fixed_tensor.to(device=param.device, dtype=param.dtype))
+                    patched += 1
+    return patched
 
 
 def _strip_thinking(text: str) -> str:
@@ -303,29 +364,36 @@ def main() -> None:
     model_name = args.model
     max_new_tokens = None if args.no_max_new_tokens else args.max_new_tokens
     clean_output = not args.no_clean_output
-    try:
-        if "qwen3-vl-30b-a3b" in model_name.lower() and Qwen3VLMoeForConditionalGeneration is not None:
-            model = _from_pretrained_compat(Qwen3VLMoeForConditionalGeneration, model_name, torch_dtype)
-        elif AutoModelForImageTextToText is not None:
-            model = _from_pretrained_compat(AutoModelForImageTextToText, model_name, torch_dtype)
-        elif AutoModelForVision2Seq is not None:
-            model = _from_pretrained_compat(AutoModelForVision2Seq, model_name, torch_dtype)
-        else:
-            raise RuntimeError(
-                "Your Transformers version is too old for Qwen3-VL. "
-                "Install a newer Transformers (or from source) that provides "
-                "AutoModelForImageTextToText or AutoModelForVision2Seq."
+    if "qwen3-vl-30b-a3b" in model_name.lower() and Qwen3VLMoeForConditionalGeneration is not None:
+        try:
+            model = _from_pretrained_compat(
+                Qwen3VLMoeForConditionalGeneration,
+                model_name,
+                torch_dtype,
+                ignore_mismatched_sizes=False,
             )
-    except RuntimeError as exc:
-        if "ignore_mismatched_sizes" in str(exc) and "qwen3-vl-30b-a3b" in model_name.lower():
-            raise RuntimeError(
-                "Failed to load Qwen/Qwen3-VL-30B-A3B-Instruct because MoE tensor shapes mismatch your "
-                "installed Transformers implementation. Please update Transformers to the latest main branch "
-                "(e.g. `pip install --upgrade git+https://github.com/huggingface/transformers`) and retry. "
-                "Do not set `ignore_mismatched_sizes=True` for this case, as it would reinitialize critical MoE "
-                "weights and severely degrade output quality."
-            ) from exc
-        raise
+        except RuntimeError as exc:
+            if "ignore_mismatched_sizes" not in str(exc):
+                raise
+            # Known HF/Qwen3-VL mismatch in some builds: load, then patch MoE tensors from checkpoint.
+            model = _from_pretrained_compat(
+                Qwen3VLMoeForConditionalGeneration,
+                model_name,
+                torch_dtype,
+                ignore_mismatched_sizes=True,
+            )
+            patched = _patch_qwen3_vl_30b_moe_weights(model, model_name)
+            print(f"Patched {patched} Qwen3-VL MoE tensors from checkpoint.")
+    elif AutoModelForImageTextToText is not None:
+        model = _from_pretrained_compat(AutoModelForImageTextToText, model_name, torch_dtype)
+    elif AutoModelForVision2Seq is not None:
+        model = _from_pretrained_compat(AutoModelForVision2Seq, model_name, torch_dtype)
+    else:
+        raise RuntimeError(
+            "Your Transformers version is too old for Qwen3-VL. "
+            "Install a newer Transformers (or from source) that provides "
+            "AutoModelForImageTextToText or AutoModelForVision2Seq."
+        )
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
     task_dirs = _iter_task_dirs(args.inputs_dir)
