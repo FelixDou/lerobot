@@ -295,11 +295,7 @@ def main() -> None:
                 "AutoModelForImageTextToText or AutoModelForVision2Seq."
             )
     except RuntimeError as exc:
-        if (
-            "ignore_mismatched_sizes" in str(exc)
-            and "qwen3-vl-30b-a3b" in model_name.lower()
-            and "MISMATCH" in str(exc)
-        ):
+        if "ignore_mismatched_sizes" in str(exc) and "qwen3-vl-30b-a3b" in model_name.lower():
             raise RuntimeError(
                 "Failed to load Qwen/Qwen3-VL-30B-A3B-Instruct because MoE tensor shapes mismatch your "
                 "installed Transformers implementation. Please update Transformers to the latest main branch "
