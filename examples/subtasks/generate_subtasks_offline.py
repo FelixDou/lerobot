@@ -16,6 +16,10 @@ try:
     from transformers import AutoModelForImageTextToText
 except ImportError:  # Older Transformers
     AutoModelForImageTextToText = None
+try:
+    from transformers import Qwen3VLMoeForConditionalGeneration
+except ImportError:  # Older Transformers
+    Qwen3VLMoeForConditionalGeneration = None
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -25,6 +29,17 @@ def _resolve_dtype(name: str) -> torch.dtype:
     if name in {"fp16", "float16"}:
         return torch.float16
     return torch.float32
+
+
+def _from_pretrained_compat(model_cls, model_name: str, dtype: torch.dtype):
+    kwargs = {"trust_remote_code": True, "device_map": "auto"}
+    try:
+        # Newer Transformers versions prefer `dtype` over `torch_dtype`.
+        return model_cls.from_pretrained(model_name, dtype=dtype, **kwargs)
+    except TypeError as exc:
+        if "unexpected keyword argument 'dtype'" not in str(exc):
+            raise
+        return model_cls.from_pretrained(model_name, torch_dtype=dtype, **kwargs)
 
 
 def _strip_thinking(text: str) -> str:
@@ -266,20 +281,33 @@ def main() -> None:
     model_name = args.model
     max_new_tokens = None if args.no_max_new_tokens else args.max_new_tokens
     clean_output = not args.no_clean_output
-    if AutoModelForImageTextToText is not None:
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_name, torch_dtype=torch_dtype, trust_remote_code=True, device_map="auto"
-        )
-    elif AutoModelForVision2Seq is not None:
-        model = AutoModelForVision2Seq.from_pretrained(
-            model_name, torch_dtype=torch_dtype, trust_remote_code=True, device_map="auto"
-        )
-    else:
-        raise RuntimeError(
-            "Your Transformers version is too old for Qwen3-VL. "
-            "Install a newer Transformers (or from source) that provides "
-            "AutoModelForImageTextToText or AutoModelForVision2Seq."
-        )
+    try:
+        if "qwen3-vl-30b-a3b" in model_name.lower() and Qwen3VLMoeForConditionalGeneration is not None:
+            model = _from_pretrained_compat(Qwen3VLMoeForConditionalGeneration, model_name, torch_dtype)
+        elif AutoModelForImageTextToText is not None:
+            model = _from_pretrained_compat(AutoModelForImageTextToText, model_name, torch_dtype)
+        elif AutoModelForVision2Seq is not None:
+            model = _from_pretrained_compat(AutoModelForVision2Seq, model_name, torch_dtype)
+        else:
+            raise RuntimeError(
+                "Your Transformers version is too old for Qwen3-VL. "
+                "Install a newer Transformers (or from source) that provides "
+                "AutoModelForImageTextToText or AutoModelForVision2Seq."
+            )
+    except RuntimeError as exc:
+        if (
+            "ignore_mismatched_sizes" in str(exc)
+            and "qwen3-vl-30b-a3b" in model_name.lower()
+            and "MISMATCH" in str(exc)
+        ):
+            raise RuntimeError(
+                "Failed to load Qwen/Qwen3-VL-30B-A3B-Instruct because MoE tensor shapes mismatch your "
+                "installed Transformers implementation. Please update Transformers to the latest main branch "
+                "(e.g. `pip install --upgrade git+https://github.com/huggingface/transformers`) and retry. "
+                "Do not set `ignore_mismatched_sizes=True` for this case, as it would reinitialize critical MoE "
+                "weights and severely degrade output quality."
+            ) from exc
+        raise
     processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
 
     task_dirs = _iter_task_dirs(args.inputs_dir)
