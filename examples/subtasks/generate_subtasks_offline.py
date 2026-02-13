@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 
@@ -146,6 +147,11 @@ def _extract_tag(text: str, tag: str) -> str | None:
     return text[start + len(open_tag) : end].strip()
 
 
+def _extract_tag_list(text: str, tag: str) -> list[str]:
+    pattern = re.compile(rf"<{tag}>(.*?)</{tag}>", re.IGNORECASE | re.DOTALL)
+    return [match.group(1).strip() for match in pattern.finditer(text) if match.group(1).strip()]
+
+
 def _extract_subtask_sentence(text: str) -> str:
     sentences = [s.strip() for s in text.replace("\n", " ").split(".") if s.strip()]
     if not sentences:
@@ -178,6 +184,37 @@ def _clean_response(text: str) -> str:
     return cleaned
 
 
+def _clean_subtask_item(text: str) -> str:
+    item = _strip_thinking(text).strip()
+    item = re.sub(r"^\s*(?:[-*]|\d+[).:-])\s*", "", item)
+    item = item.strip().strip("\"'")
+    lowered = item.lower()
+    if lowered in {"none", "n/a"}:
+        return ""
+    if lowered.startswith(("task:", "prev", "previous", "updated remaining sequence")):
+        return ""
+    if lowered in {"<subtasks>", "</subtasks>"}:
+        return ""
+    return item
+
+
+def _extract_subtask_sequence(text: str) -> list[str]:
+    text = _strip_thinking(text).strip()
+    tagged_items = _extract_tag_list(text, "subtask")
+    if tagged_items:
+        return [item for item in (_clean_subtask_item(x) for x in tagged_items) if item]
+
+    tagged_block = _extract_tag(text, "subtasks")
+    raw = tagged_block if tagged_block else text
+    raw = raw.replace("->", "\n").replace(";", "\n")
+    items = []
+    for line in raw.splitlines():
+        item = _clean_subtask_item(line)
+        if item:
+            items.append(item)
+    return items
+
+
 def _build_prompt(task: str, prev_subtask: str, *, model_name: str) -> str:
     cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
     prev_text = prev_subtask.strip() if prev_subtask else "none"
@@ -196,6 +233,41 @@ def _build_prompt(task: str, prev_subtask: str, *, model_name: str) -> str:
         f"Task: {cleaned_text}\n"
         f"Prev subtask: {prev_text}\n"
         "Next subtask: <subtask>"
+    )
+
+
+def _build_sequence_prompt(task: str, prev_sequence: list[str], *, model_name: str) -> str:
+    cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+    prev_sequence_text = "none"
+    if prev_sequence:
+        prev_sequence_text = " | ".join(f"{i + 1}. {step}" for i, step in enumerate(prev_sequence))
+    prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
+    return (
+        f"{prefix}You are a robot. From the task and the current image, output the remaining subtask sequence.\n"
+        "Each subtask must be 3-8 words and use an imperative verb phrase.\n"
+        "Order subtasks from immediate next action to final action.\n"
+        "Use the previous predicted sequence as context and refine it based on current progress.\n"
+        "Drop completed subtasks, keep pending ones, and add missing future ones.\n"
+        "Output only valid XML in this exact format:\n"
+        "<subtasks>\n"
+        "<subtask>...</subtask>\n"
+        "<subtask>...</subtask>\n"
+        "</subtasks>\n"
+        "\nExample:\n"
+        "Task: put the red block in the bin\n"
+        "Previous predicted sequence: 1. move to red block | 2. grasp red block | 3. move to bin\n"
+        "Updated remaining sequence:\n"
+        "<subtasks>\n"
+        "<subtask>grasp red block</subtask>\n"
+        "<subtask>move to bin</subtask>\n"
+        "<subtask>release red block</subtask>\n"
+        "</subtasks>\n"
+        "\n"
+        f"Task: {cleaned_text}\n"
+        f"Previous predicted sequence: {prev_sequence_text}\n"
+        "Updated remaining sequence:\n"
+        "<subtasks>\n"
+        "<subtask>"
     )
 
 
@@ -284,6 +356,7 @@ def generate_subtasks_for_episode(
     image_key: str | None,
     temperature: float,
     max_new_tokens: int | None,
+    strategy: str,
     use_completion_check: bool,
     base_dir: Path,
     min_new_tokens: int,
@@ -293,45 +366,78 @@ def generate_subtasks_for_episode(
     frames = episode_payload.get("frames", [])
     task_text = episode_payload.get("task", "")
     prev_subtask = ""
+    prev_sequence: list[str] = []
     outputs = []
     for frame in frames:
         image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
-        prompt = _build_prompt(task_text, prev_subtask, model_name=model_name)
-        candidate = _generate_text(
-            model,
-            processor,
-            image,
-            prompt,
-            temperature=temperature,
-            max_new_tokens=max_new_tokens,
-            min_new_tokens=min_new_tokens,
-            disable_eos=disable_eos,
-            clean_output=clean_output,
-        )
-        final = candidate
-        if use_completion_check and prev_subtask:
-            completion_prompt = _build_completion_prompt(task_text, prev_subtask, model_name=model_name)
-            completed = _generate_text(
+        if strategy == "sequence_refinement":
+            sequence_prompt = _build_sequence_prompt(task_text, prev_sequence, model_name=model_name)
+            sequence_text = _generate_text(
                 model,
                 processor,
                 image,
-                completion_prompt,
-                temperature=0.0,
-                max_new_tokens=3,
-                min_new_tokens=1,
-                disable_eos=False,
-                clean_output=True,
+                sequence_prompt,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                disable_eos=disable_eos,
+                clean_output=False,
             )
-            if not completed.lower().startswith("y"):
-                final = prev_subtask
-        prev_subtask = final
-        outputs.append(
-            {
-                "step": frame.get("step"),
-                "image_key": chosen_key,
-                "subtask": final,
-            }
-        )
+            sequence = _extract_subtask_sequence(sequence_text)
+            if not sequence and prev_sequence:
+                sequence = list(prev_sequence)
+            if not sequence:
+                fallback = _clean_response(sequence_text)
+                if fallback:
+                    sequence = [fallback]
+            final = sequence[0] if sequence else ""
+            prev_subtask = final
+            prev_sequence = list(sequence)
+            outputs.append(
+                {
+                    "step": frame.get("step"),
+                    "image_key": chosen_key,
+                    "subtask": final,
+                    "subtask_sequence": sequence,
+                }
+            )
+        else:
+            prompt = _build_prompt(task_text, prev_subtask, model_name=model_name)
+            candidate = _generate_text(
+                model,
+                processor,
+                image,
+                prompt,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                disable_eos=disable_eos,
+                clean_output=clean_output,
+            )
+            final = candidate
+            if use_completion_check and prev_subtask:
+                completion_prompt = _build_completion_prompt(task_text, prev_subtask, model_name=model_name)
+                completed = _generate_text(
+                    model,
+                    processor,
+                    image,
+                    completion_prompt,
+                    temperature=0.0,
+                    max_new_tokens=3,
+                    min_new_tokens=1,
+                    disable_eos=False,
+                    clean_output=True,
+                )
+                if not completed.lower().startswith("y"):
+                    final = prev_subtask
+            prev_subtask = final
+            outputs.append(
+                {
+                    "step": frame.get("step"),
+                    "image_key": chosen_key,
+                    "subtask": final,
+                }
+            )
     episode_payload["subtasks"] = outputs
     return episode_payload
 
@@ -356,6 +462,12 @@ def main() -> None:
     parser.add_argument("--disable-eos", action="store_true")
     parser.add_argument("--no-clean-output", action="store_true")
     parser.add_argument("--no-completion-check", action="store_true")
+    parser.add_argument(
+        "--subtask-strategy",
+        choices=["completion_check", "sequence_refinement"],
+        default="completion_check",
+        help="Prompting strategy for subtask generation.",
+    )
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -422,6 +534,7 @@ def main() -> None:
                 image_key=args.image_key,
                 temperature=args.temperature,
                 max_new_tokens=max_new_tokens,
+                strategy=args.subtask_strategy,
                 use_completion_check=not args.no_completion_check,
                 base_dir=task_dir,
                 min_new_tokens=args.min_new_tokens,

@@ -39,6 +39,7 @@ New script to generate subtasks from stored frames:
 Key behavior:
 - Prompts for short imperative subtasks.
 - Optional completion check (yes/no) to keep previous subtask if incomplete.
+- Optional sequence-refinement strategy that predicts the full remaining subtask plan per frame and keeps the first item as the main subtask.
 - Cleans up model outputs (removes thinking blocks, trims acknowledgments).
 
 ### 4) Video Annotation
@@ -92,7 +93,12 @@ python examples/subtasks/generate_subtasks_offline.py \
   --model Qwen/Qwen3-VL-4B-Instruct \
   --dtype bfloat16 \
   --temperature 0.0 \
-  --max-new-tokens 16
+  --max-new-tokens 16 \
+  --subtask-strategy completion_check
+
+# Alternative strategy:
+# --subtask-strategy sequence_refinement
+# (stores `subtask` and full `subtask_sequence` per frame)
 ```
 
 ### Step 3: Annotate videos
@@ -124,4 +130,5 @@ Minimal requirements for the offline scripts are listed in `requirements.txt`:
 ## Notes
 - For Qwen3‑Thinking models, outputs are cleaned to keep only the final answer.
 - The completion check prompt now only uses the previous subtask (no full task).
+- Sequence-refinement uses the previous predicted sequence as context to self-refine and track progress.
 - Use `subtask_inputs_stride` to reduce storage or speed up VLM runs.
