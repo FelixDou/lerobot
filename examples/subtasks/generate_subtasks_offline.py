@@ -245,8 +245,12 @@ def _build_sequence_prompt(task: str, prev_sequence: list[str], *, model_name: s
     return (
         f"{prefix}You are a robot. From the task and the current image, output the remaining subtask sequence.\n"
         "Each subtask must be 3-8 words and use an imperative verb phrase.\n"
+        "Predict the FULL sequence needed to complete the high-level task end-to-end.\n"
+        "If the high-level task has several main actions/phases, include subtasks for all phases until completion.\n"
         "Order subtasks from immediate next action to final action.\n"
-        "Use the previous predicted sequence as context and refine it based on current progress.\n"
+        "Use the previous predicted sequence as context and explicitly track task advancement across steps.\n"
+        "Compare with the previous predicted sequence, remove only completed subtasks, and keep the rest consistent.\n"
+        "If nothing fundamentally changed in the scene/progress, it is valid to repeat the same sequence.\n"
         "Drop completed subtasks, keep pending ones, and add missing future ones.\n"
         "Output only valid XML in this exact format:\n"
         "<subtasks>\n"
