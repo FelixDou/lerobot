@@ -8,6 +8,69 @@ from pathlib import Path
 import imageio
 
 
+def _parse_ffprobe_rate(rate: str | None) -> float | None:
+    if not rate:
+        return None
+    rate = str(rate).strip()
+    if not rate or rate in {"0/0", "N/A"}:
+        return None
+    if "/" in rate:
+        num, den = rate.split("/", 1)
+        try:
+            num_f = float(num)
+            den_f = float(den)
+            if den_f == 0:
+                return None
+            return num_f / den_f
+        except ValueError:
+            return None
+    try:
+        return float(rate)
+    except ValueError:
+        return None
+
+
+def _ffprobe_video_meta(video_path: Path) -> tuple[float | None, int | None, float | None]:
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate,nb_frames,duration",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    payload = json.loads(result.stdout or "{}")
+    streams = payload.get("streams", [])
+    stream = streams[0] if streams else {}
+    fps = _parse_ffprobe_rate(stream.get("avg_frame_rate")) or _parse_ffprobe_rate(stream.get("r_frame_rate"))
+
+    nframes = None
+    nframes_raw = stream.get("nb_frames")
+    if nframes_raw not in {None, "", "N/A"}:
+        try:
+            nframes = int(nframes_raw)
+        except (TypeError, ValueError):
+            nframes = None
+
+    duration = None
+    for raw in (stream.get("duration"), payload.get("format", {}).get("duration")):
+        if raw in {None, "", "N/A"}:
+            continue
+        try:
+            duration = float(raw)
+            break
+        except (TypeError, ValueError):
+            continue
+    return fps, nframes, duration
+
+
 def _format_srt_time(seconds: float) -> str:
     millis = int(round(seconds * 1000))
     hours = millis // 3_600_000
@@ -41,13 +104,17 @@ def _extract_steps(payload: dict) -> list[tuple[int, str]]:
 
 
 def _get_video_meta(video_path: Path) -> tuple[float | None, int | None, float | None]:
-    reader = imageio.get_reader(video_path)
-    meta = reader.get_meta_data()
-    reader.close()
-    fps = meta.get("fps")
-    nframes = meta.get("nframes")
-    duration = meta.get("duration")
-    return fps, nframes, duration
+    try:
+        reader = imageio.get_reader(video_path)
+        meta = reader.get_meta_data()
+        reader.close()
+        fps = meta.get("fps")
+        nframes = meta.get("nframes")
+        duration = meta.get("duration")
+        return fps, nframes, duration
+    except Exception:
+        # Some imageio/pyav versions fail on metadata seeks for valid mp4 files.
+        return _ffprobe_video_meta(video_path)
 
 
 def _write_srt(steps: list[tuple[int, str]], fps: float, end_time_s: float, output_path: Path) -> None:
