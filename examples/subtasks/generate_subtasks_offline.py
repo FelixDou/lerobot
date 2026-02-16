@@ -215,17 +215,13 @@ def _extract_subtask_sequence(text: str) -> list[str]:
     return items
 
 
-def _build_prompt(task: str, prev_subtask: str, completed_subtasks: list[str], *, model_name: str) -> str:
+def _build_prompt(task: str, prev_subtask: str, *, model_name: str) -> str:
     cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
     prev_text = prev_subtask.strip() if prev_subtask else "none"
-    completed_text = "none"
-    if completed_subtasks:
-        completed_text = " | ".join(f"{i + 1}. {step}" for i, step in enumerate(completed_subtasks))
     prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
     return (
         f"{prefix}You are a robot. From the task and the current image, output the next subtask.\n"
         "Use 3-8 words. Use an imperative verb phrase.\n"
-        "Use the completed subtasks list to avoid going back to already finished actions.\n"
         "If nothing changed since the previous step, repeat the previous subtask.\n"
         "If the previous subtask is complete, update it to the next one.\n"
         "Do not restate the task. Output only the subtask in this XML tag: <subtask>...</subtask>.\n"
@@ -235,28 +231,20 @@ def _build_prompt(task: str, prev_subtask: str, completed_subtasks: list[str], *
         "Next subtask: <subtask>grasp red block</subtask>\n"
         "\n"
         f"Task: {cleaned_text}\n"
-        f"Completed subtasks: {completed_text}\n"
         f"Prev subtask: {prev_text}\n"
         "Next subtask: <subtask>"
     )
 
 
-def _build_sequence_prompt(task: str, prev_sequence: list[str], *, model_name: str) -> str:
+def _build_sequence_prompt(task: str, *, model_name: str) -> str:
     cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
-    prev_sequence_text = "none"
-    if prev_sequence:
-        prev_sequence_text = " | ".join(f"{i + 1}. {step}" for i, step in enumerate(prev_sequence))
     prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
     return (
-        f"{prefix}You are a robot. From the task and the current image, output the remaining subtask sequence.\n"
+        f"{prefix}You are a robot. From the task and the current image, output the full subtask sequence.\n"
         "Each subtask must be 3-8 words and use an imperative verb phrase.\n"
         "Predict the FULL sequence needed to complete the high-level task end-to-end.\n"
         "If the high-level task has several main actions/phases, include subtasks for all phases until completion.\n"
         "Order subtasks from immediate next action to final action.\n"
-        "Use the previous predicted sequence as context and explicitly track task advancement across steps.\n"
-        "Compare with the previous predicted sequence, remove only completed subtasks, and keep the rest consistent.\n"
-        "If nothing fundamentally changed in the scene/progress, it is valid to repeat the same sequence.\n"
-        "Drop completed subtasks, keep pending ones, and add missing future ones.\n"
         "Output only valid XML in this exact format:\n"
         "<subtasks>\n"
         "<subtask>...</subtask>\n"
@@ -264,19 +252,39 @@ def _build_sequence_prompt(task: str, prev_sequence: list[str], *, model_name: s
         "</subtasks>\n"
         "\nExample:\n"
         "Task: put the red block in the bin\n"
-        "Previous predicted sequence: 1. move to red block | 2. grasp red block | 3. move to bin\n"
-        "Updated remaining sequence:\n"
+        "Full sequence:\n"
         "<subtasks>\n"
+        "<subtask>move to red block</subtask>\n"
         "<subtask>grasp red block</subtask>\n"
         "<subtask>move to bin</subtask>\n"
         "<subtask>release red block</subtask>\n"
         "</subtasks>\n"
         "\n"
         f"Task: {cleaned_text}\n"
-        f"Previous predicted sequence: {prev_sequence_text}\n"
-        "Updated remaining sequence:\n"
+        "Full sequence:\n"
         "<subtasks>\n"
         "<subtask>"
+    )
+
+
+def _build_sequence_selection_prompt(
+    task: str, sequence: list[str], prev_subtask: str, *, model_name: str
+) -> str:
+    cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+    prev_text = prev_subtask.strip() if prev_subtask else "none"
+    sequence_text = " | ".join(f"{i + 1}. {step}" for i, step in enumerate(sequence))
+    prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
+    return (
+        f"{prefix}You are a robot. A fixed subtask sequence was generated at t=0.\n"
+        "From the current image, pick the ONE correct current subtask from the fixed sequence.\n"
+        "Copy one option exactly as written (same wording).\n"
+        "If nothing changed, it is valid to repeat the previous selected subtask.\n"
+        "Output only this XML tag: <subtask>...</subtask>.\n"
+        "\n"
+        f"Task: {cleaned_text}\n"
+        f"Fixed sequence: {sequence_text}\n"
+        f"Previous selected subtask: {prev_text}\n"
+        "Current subtask: <subtask>"
     )
 
 
@@ -356,6 +364,34 @@ def _generate_text(
     return text.strip()
 
 
+def _normalize_subtask(text: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", text.lower())).strip()
+
+
+def _pick_subtask_from_sequence(choice: str, sequence: list[str]) -> str:
+    if not sequence:
+        return ""
+    if not choice:
+        return ""
+    choice_stripped = choice.strip()
+    if choice_stripped.isdigit():
+        idx = int(choice_stripped) - 1
+        if 0 <= idx < len(sequence):
+            return sequence[idx]
+
+    norm_choice = _normalize_subtask(choice_stripped)
+    if not norm_choice:
+        return ""
+    for step in sequence:
+        if _normalize_subtask(step) == norm_choice:
+            return step
+    for step in sequence:
+        norm_step = _normalize_subtask(step)
+        if norm_choice in norm_step or norm_step in norm_choice:
+            return step
+    return ""
+
+
 def generate_subtasks_for_episode(
     episode_payload: dict,
     *,
@@ -375,49 +411,61 @@ def generate_subtasks_for_episode(
     frames = episode_payload.get("frames", [])
     task_text = episode_payload.get("task", "")
     prev_subtask = ""
-    completed_subtasks: list[str] = []
-    prev_sequence: list[str] = []
+    fixed_sequence: list[str] = []
     outputs = []
     for frame in frames:
         image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
         if strategy == "sequence_refinement":
-            sequence_prompt = _build_sequence_prompt(task_text, prev_sequence, model_name=model_name)
-            sequence_text = _generate_text(
+            if not fixed_sequence:
+                sequence_prompt = _build_sequence_prompt(task_text, model_name=model_name)
+                sequence_text = _generate_text(
+                    model,
+                    processor,
+                    image,
+                    sequence_prompt,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    disable_eos=disable_eos,
+                    clean_output=False,
+                )
+                fixed_sequence = _extract_subtask_sequence(sequence_text)
+                if not fixed_sequence:
+                    fallback = _clean_response(sequence_text)
+                    if fallback:
+                        fixed_sequence = [fallback]
+
+            selection_prompt = _build_sequence_selection_prompt(
+                task_text,
+                fixed_sequence,
+                prev_subtask,
+                model_name=model_name,
+            )
+            choice = _generate_text(
                 model,
                 processor,
                 image,
-                sequence_prompt,
+                selection_prompt,
                 temperature=temperature,
                 max_new_tokens=max_new_tokens,
                 min_new_tokens=min_new_tokens,
                 disable_eos=disable_eos,
-                clean_output=False,
+                clean_output=True,
             )
-            sequence = _extract_subtask_sequence(sequence_text)
-            if not sequence and prev_sequence:
-                sequence = list(prev_sequence)
-            if not sequence:
-                fallback = _clean_response(sequence_text)
-                if fallback:
-                    sequence = [fallback]
-            final = sequence[0] if sequence else ""
+            final = _pick_subtask_from_sequence(choice, fixed_sequence)
+            if not final:
+                final = prev_subtask if prev_subtask else (fixed_sequence[0] if fixed_sequence else choice)
             prev_subtask = final
-            prev_sequence = list(sequence)
             outputs.append(
                 {
                     "step": frame.get("step"),
                     "image_key": chosen_key,
                     "subtask": final,
-                    "subtask_sequence": sequence,
+                    "subtask_sequence": list(fixed_sequence),
                 }
             )
         else:
-            prompt = _build_prompt(
-                task_text,
-                prev_subtask,
-                completed_subtasks,
-                model_name=model_name,
-            )
+            prompt = _build_prompt(task_text, prev_subtask, model_name=model_name)
             candidate = _generate_text(
                 model,
                 processor,
@@ -445,10 +493,6 @@ def generate_subtasks_for_episode(
                 )
                 if not completed.lower().startswith("y"):
                     final = prev_subtask
-                else:
-                    prev_clean = prev_subtask.strip()
-                    if prev_clean and (not completed_subtasks or completed_subtasks[-1] != prev_clean):
-                        completed_subtasks.append(prev_clean)
             prev_subtask = final
             outputs.append(
                 {
