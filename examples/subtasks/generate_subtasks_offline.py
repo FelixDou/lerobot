@@ -215,13 +215,17 @@ def _extract_subtask_sequence(text: str) -> list[str]:
     return items
 
 
-def _build_prompt(task: str, prev_subtask: str, *, model_name: str) -> str:
+def _build_prompt(task: str, prev_subtask: str, completed_subtasks: list[str], *, model_name: str) -> str:
     cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
     prev_text = prev_subtask.strip() if prev_subtask else "none"
+    completed_text = "none"
+    if completed_subtasks:
+        completed_text = " | ".join(f"{i + 1}. {step}" for i, step in enumerate(completed_subtasks))
     prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
     return (
         f"{prefix}You are a robot. From the task and the current image, output the next subtask.\n"
         "Use 3-8 words. Use an imperative verb phrase.\n"
+        "Use the completed subtasks list to avoid going back to already finished actions.\n"
         "If nothing changed since the previous step, repeat the previous subtask.\n"
         "If the previous subtask is complete, update it to the next one.\n"
         "Do not restate the task. Output only the subtask in this XML tag: <subtask>...</subtask>.\n"
@@ -231,6 +235,7 @@ def _build_prompt(task: str, prev_subtask: str, *, model_name: str) -> str:
         "Next subtask: <subtask>grasp red block</subtask>\n"
         "\n"
         f"Task: {cleaned_text}\n"
+        f"Completed subtasks: {completed_text}\n"
         f"Prev subtask: {prev_text}\n"
         "Next subtask: <subtask>"
     )
@@ -370,6 +375,7 @@ def generate_subtasks_for_episode(
     frames = episode_payload.get("frames", [])
     task_text = episode_payload.get("task", "")
     prev_subtask = ""
+    completed_subtasks: list[str] = []
     prev_sequence: list[str] = []
     outputs = []
     for frame in frames:
@@ -406,7 +412,12 @@ def generate_subtasks_for_episode(
                 }
             )
         else:
-            prompt = _build_prompt(task_text, prev_subtask, model_name=model_name)
+            prompt = _build_prompt(
+                task_text,
+                prev_subtask,
+                completed_subtasks,
+                model_name=model_name,
+            )
             candidate = _generate_text(
                 model,
                 processor,
@@ -434,6 +445,10 @@ def generate_subtasks_for_episode(
                 )
                 if not completed.lower().startswith("y"):
                     final = prev_subtask
+                else:
+                    prev_clean = prev_subtask.strip()
+                    if prev_clean and (not completed_subtasks or completed_subtasks[-1] != prev_clean):
+                        completed_subtasks.append(prev_clean)
             prev_subtask = final
             outputs.append(
                 {
