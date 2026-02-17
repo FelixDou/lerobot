@@ -97,7 +97,7 @@ python examples/subtasks/generate_subtasks_offline.py \
   --subtask-strategy completion_check
 
 # Alternative strategy:
-# --subtask-strategy sequence_refinement
+# --subtask-strategy pick_list
 # (stores `subtask` and full `subtask_sequence` per frame)
 ```
 
@@ -130,5 +130,5 @@ Minimal requirements for the offline scripts are listed in `requirements.txt`:
 ## Notes
 - For Qwen3‑Thinking models, outputs are cleaned to keep only the final answer.
 - The completion check prompt now only uses the previous subtask (no full task).
-- Sequence-refinement uses the previous predicted sequence as context to self-refine and track progress.
+- `pick_list` generates a full list at t=0, then picks the current subtask from that fixed list at each step.
 - Use `subtask_inputs_stride` to reduce storage or speed up VLM runs.

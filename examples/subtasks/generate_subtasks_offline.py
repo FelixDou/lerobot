@@ -244,6 +244,7 @@ def _build_sequence_prompt(task: str, *, model_name: str) -> str:
         "Each subtask must be 3-8 words and use an imperative verb phrase.\n"
         "Predict the FULL sequence needed to complete the high-level task end-to-end.\n"
         "If the high-level task has several main actions/phases, include subtasks for all phases until completion.\n"
+        "If the task asks to manipulate multiple objects (e.g. 'both A and B'), include subtasks for every object.\n"
         "Order subtasks from immediate next action to final action.\n"
         "Output only valid XML in this exact format:\n"
         "<subtasks>\n"
@@ -259,6 +260,19 @@ def _build_sequence_prompt(task: str, *, model_name: str) -> str:
         "<subtask>move to bin</subtask>\n"
         "<subtask>release red block</subtask>\n"
         "</subtasks>\n"
+        "\nExample:\n"
+        "Task: put both the cream cheese box and the butter in the basket\n"
+        "Full sequence:\n"
+        "<subtasks>\n"
+        "<subtask>move to cream cheese box</subtask>\n"
+        "<subtask>grasp cream cheese box</subtask>\n"
+        "<subtask>move cream cheese box to basket</subtask>\n"
+        "<subtask>release cream cheese box in basket</subtask>\n"
+        "<subtask>move to butter</subtask>\n"
+        "<subtask>grasp butter</subtask>\n"
+        "<subtask>move butter to basket</subtask>\n"
+        "<subtask>release butter in basket</subtask>\n"
+        "</subtasks>\n"
         "\n"
         f"Task: {cleaned_text}\n"
         "Full sequence:\n"
@@ -267,23 +281,18 @@ def _build_sequence_prompt(task: str, *, model_name: str) -> str:
     )
 
 
-def _build_sequence_selection_prompt(
-    task: str, sequence: list[str], prev_subtask: str, *, model_name: str
-) -> str:
+def _build_sequence_selection_prompt(task: str, sequence: list[str], *, model_name: str) -> str:
     cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
-    prev_text = prev_subtask.strip() if prev_subtask else "none"
     sequence_text = " | ".join(f"{i + 1}. {step}" for i, step in enumerate(sequence))
     prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
     return (
         f"{prefix}You are a robot. A fixed subtask sequence was generated at t=0.\n"
         "From the current image, pick the ONE correct current subtask from the fixed sequence.\n"
         "Copy one option exactly as written (same wording).\n"
-        "If nothing changed, it is valid to repeat the previous selected subtask.\n"
         "Output only this XML tag: <subtask>...</subtask>.\n"
         "\n"
         f"Task: {cleaned_text}\n"
         f"Fixed sequence: {sequence_text}\n"
-        f"Previous selected subtask: {prev_text}\n"
         "Current subtask: <subtask>"
     )
 
@@ -415,7 +424,7 @@ def generate_subtasks_for_episode(
     outputs = []
     for frame in frames:
         image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
-        if strategy == "sequence_refinement":
+        if strategy == "pick_list":
             if not fixed_sequence:
                 sequence_prompt = _build_sequence_prompt(task_text, model_name=model_name)
                 sequence_text = _generate_text(
@@ -438,7 +447,6 @@ def generate_subtasks_for_episode(
             selection_prompt = _build_sequence_selection_prompt(
                 task_text,
                 fixed_sequence,
-                prev_subtask,
                 model_name=model_name,
             )
             choice = _generate_text(
@@ -527,11 +535,13 @@ def main() -> None:
     parser.add_argument("--no-completion-check", action="store_true")
     parser.add_argument(
         "--subtask-strategy",
-        choices=["completion_check", "sequence_refinement"],
+        choices=["completion_check", "pick_list", "sequence_refinement"],
         default="completion_check",
-        help="Prompting strategy for subtask generation.",
+        help="Prompting strategy for subtask generation. Use `pick_list` (preferred).",
     )
     args = parser.parse_args()
+    if args.subtask_strategy == "sequence_refinement":
+        args.subtask_strategy = "pick_list"
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     torch_dtype = _resolve_dtype(args.dtype)
