@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import json
+import os
 import re
+import time
 from collections import defaultdict
+from io import BytesIO
 from pathlib import Path
 
 import torch
@@ -335,6 +339,38 @@ def _prepare_inputs(processor, image: Image.Image, text: str, *, use_qwen_chat: 
     return processor(text=text, images=image, return_tensors="pt", padding=True)
 
 
+def _to_data_url(image: Image.Image) -> str:
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=95)
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def _extract_openai_output_text(response) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    def _get(obj, key):
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    chunks = []
+    output = _get(response, "output") or []
+    for item in output:
+        if _get(item, "type") != "message":
+            continue
+        content = _get(item, "content") or []
+        for part in content:
+            if _get(part, "type") == "output_text":
+                text = _get(part, "text")
+                if isinstance(text, str) and text:
+                    chunks.append(text)
+
+    return "\n".join(chunks).strip()
+
+
 def _generate_text(
     model,
     processor,
@@ -346,7 +382,54 @@ def _generate_text(
     min_new_tokens: int,
     disable_eos: bool,
     clean_output: bool,
+    backend: str,
+    model_name: str,
+    openai_image_detail: str,
+    openai_reasoning_effort: str | None,
 ):
+    if backend == "openai":
+        image_url = _to_data_url(image)
+        request = {
+            "model": model_name,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": text},
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                            "detail": openai_image_detail,
+                        },
+                    ],
+                }
+            ],
+        }
+        if max_new_tokens is not None:
+            request["max_output_tokens"] = max_new_tokens
+        if temperature > 0:
+            request["temperature"] = temperature
+            request["top_p"] = 0.9
+        if openai_reasoning_effort is not None and (
+            model_name.startswith("gpt-5")
+            or model_name.startswith("o")
+        ):
+            request["reasoning"] = {"effort": openai_reasoning_effort}
+
+        for attempt in range(3):
+            try:
+                response = model.responses.create(**request)
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
+
+        generated_text = _extract_openai_output_text(response)
+        if clean_output:
+            return _clean_response(generated_text)
+        return generated_text.strip()
+
     inputs = _prepare_inputs(
         processor,
         image,
@@ -416,6 +499,9 @@ def generate_subtasks_for_episode(
     min_new_tokens: int,
     disable_eos: bool,
     clean_output: bool,
+    backend: str,
+    openai_image_detail: str,
+    openai_reasoning_effort: str | None,
 ) -> dict:
     frames = episode_payload.get("frames", [])
     task_text = episode_payload.get("task", "")
@@ -437,6 +523,10 @@ def generate_subtasks_for_episode(
                     min_new_tokens=min_new_tokens,
                     disable_eos=disable_eos,
                     clean_output=False,
+                    backend=backend,
+                    model_name=model_name,
+                    openai_image_detail=openai_image_detail,
+                    openai_reasoning_effort=openai_reasoning_effort,
                 )
                 fixed_sequence = _extract_subtask_sequence(sequence_text)
                 if not fixed_sequence:
@@ -459,6 +549,10 @@ def generate_subtasks_for_episode(
                 min_new_tokens=min_new_tokens,
                 disable_eos=disable_eos,
                 clean_output=True,
+                backend=backend,
+                model_name=model_name,
+                openai_image_detail=openai_image_detail,
+                openai_reasoning_effort=openai_reasoning_effort,
             )
             final = _pick_subtask_from_sequence(choice, fixed_sequence)
             if not final:
@@ -484,6 +578,10 @@ def generate_subtasks_for_episode(
                 min_new_tokens=min_new_tokens,
                 disable_eos=disable_eos,
                 clean_output=clean_output,
+                backend=backend,
+                model_name=model_name,
+                openai_image_detail=openai_image_detail,
+                openai_reasoning_effort=openai_reasoning_effort,
             )
             final = candidate
             if use_completion_check and prev_subtask:
@@ -498,6 +596,10 @@ def generate_subtasks_for_episode(
                     min_new_tokens=1,
                     disable_eos=False,
                     clean_output=True,
+                    backend=backend,
+                    model_name=model_name,
+                    openai_image_detail=openai_image_detail,
+                    openai_reasoning_effort=openai_reasoning_effort,
                 )
                 if not completed.lower().startswith("y"):
                     final = prev_subtask
@@ -523,8 +625,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--inputs-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--backend", choices=["hf", "openai"], default="hf")
     parser.add_argument("--model", default="Qwen/Qwen3-VL-4B-Instruct")
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--openai-image-detail", choices=["auto", "low", "high"], default="auto")
+    parser.add_argument("--openai-reasoning-effort", default=None)
     parser.add_argument("--image-key", default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-new-tokens", type=int, default=64)
@@ -544,42 +649,58 @@ def main() -> None:
         args.subtask_strategy = "pick_list"
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    torch_dtype = _resolve_dtype(args.dtype)
-
     model_name = args.model
+    if args.backend == "openai" and model_name == "Qwen/Qwen3-VL-4B-Instruct":
+        model_name = "gpt-5.2"
     max_new_tokens = None if args.no_max_new_tokens else args.max_new_tokens
     clean_output = not args.no_clean_output
-    if "qwen3-vl-30b-a3b" in model_name.lower() and Qwen3VLMoeForConditionalGeneration is not None:
-        try:
-            model = _from_pretrained_compat(
-                Qwen3VLMoeForConditionalGeneration,
-                model_name,
-                torch_dtype,
-                ignore_mismatched_sizes=False,
+    processor = None
+    if args.backend == "hf":
+        torch_dtype = _resolve_dtype(args.dtype)
+        if "qwen3-vl-30b-a3b" in model_name.lower() and Qwen3VLMoeForConditionalGeneration is not None:
+            try:
+                model = _from_pretrained_compat(
+                    Qwen3VLMoeForConditionalGeneration,
+                    model_name,
+                    torch_dtype,
+                    ignore_mismatched_sizes=False,
+                )
+            except RuntimeError as exc:
+                if "ignore_mismatched_sizes" not in str(exc):
+                    raise
+                # Known HF/Qwen3-VL mismatch in some builds: load, then patch MoE tensors from checkpoint.
+                model = _from_pretrained_compat(
+                    Qwen3VLMoeForConditionalGeneration,
+                    model_name,
+                    torch_dtype,
+                    ignore_mismatched_sizes=True,
+                )
+                patched = _patch_qwen3_vl_30b_moe_weights(model, model_name)
+                print(f"Patched {patched} Qwen3-VL MoE tensors from checkpoint.")
+        elif AutoModelForImageTextToText is not None:
+            model = _from_pretrained_compat(AutoModelForImageTextToText, model_name, torch_dtype)
+        elif AutoModelForVision2Seq is not None:
+            model = _from_pretrained_compat(AutoModelForVision2Seq, model_name, torch_dtype)
+        else:
+            raise RuntimeError(
+                "Your Transformers version is too old for Qwen3-VL. "
+                "Install a newer Transformers (or from source) that provides "
+                "AutoModelForImageTextToText or AutoModelForVision2Seq."
             )
-        except RuntimeError as exc:
-            if "ignore_mismatched_sizes" not in str(exc):
-                raise
-            # Known HF/Qwen3-VL mismatch in some builds: load, then patch MoE tensors from checkpoint.
-            model = _from_pretrained_compat(
-                Qwen3VLMoeForConditionalGeneration,
-                model_name,
-                torch_dtype,
-                ignore_mismatched_sizes=True,
-            )
-            patched = _patch_qwen3_vl_30b_moe_weights(model, model_name)
-            print(f"Patched {patched} Qwen3-VL MoE tensors from checkpoint.")
-    elif AutoModelForImageTextToText is not None:
-        model = _from_pretrained_compat(AutoModelForImageTextToText, model_name, torch_dtype)
-    elif AutoModelForVision2Seq is not None:
-        model = _from_pretrained_compat(AutoModelForVision2Seq, model_name, torch_dtype)
+        processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
     else:
-        raise RuntimeError(
-            "Your Transformers version is too old for Qwen3-VL. "
-            "Install a newer Transformers (or from source) that provides "
-            "AutoModelForImageTextToText or AutoModelForVision2Seq."
-        )
-    processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError(
+                "OPENAI_API_KEY is required when --backend openai is used."
+            )
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "The `openai` package is required when --backend openai is used. "
+                "Install it with `pip install openai`."
+            ) from exc
+        model = OpenAI()
 
     task_dirs = _iter_task_dirs(args.inputs_dir)
     for task_dir in task_dirs:
@@ -613,6 +734,9 @@ def main() -> None:
                 min_new_tokens=args.min_new_tokens,
                 disable_eos=args.disable_eos,
                 clean_output=clean_output,
+                backend=args.backend,
+                openai_image_detail=args.openai_image_detail,
+                openai_reasoning_effort=args.openai_reasoning_effort,
             )
             output_path = output_task_dir / episode_path.name
             with open(output_path, "w") as f:

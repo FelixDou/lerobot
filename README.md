@@ -5,7 +5,7 @@ This fork focuses on a decoupled subtask pipeline for PI05 evaluations. The goal
 ## What Was Added (Summary)
 
 1) Export subtask inputs during eval (frames + task text).
-2) Offline VLM subtask generation (Qwen‑VL models).
+2) Offline subtask generation with either VLM (Qwen‑VL) or MLLM (OpenAI GPT).
 3) Two‑stage subtask logic (generate candidate, then completion check).
 4) Video annotation with per‑frame subtasks.
 5) Output/log reorganization helpers.
@@ -32,7 +32,7 @@ Exported data:
 - Task text per episode
 - JSON index of frames and paths
 
-### 3) Offline VLM Subtask Generation
+### 3) Offline Subtask Generation (VLM or MLLM)
 New script to generate subtasks from stored frames:
 - `examples/subtasks/generate_subtasks_offline.py`
 
@@ -85,9 +85,12 @@ lerobot-eval \
   --policy.device=cuda
 ```
 
-### Step 2: Offline subtask generation (Qwen‑VL)
+### Step 2: Offline subtask generation
+
+Hugging Face VLM (existing flow, unchanged):
 ```
 python examples/subtasks/generate_subtasks_offline.py \
+  --backend hf \
   --inputs-dir outputs/eval/<date>/<run>/inputs/subtask_inputs \
   --output-dir outputs/eval/<date>/<run>/subtasks/qwen3 \
   --model Qwen/Qwen3-VL-4B-Instruct \
@@ -100,6 +103,24 @@ python examples/subtasks/generate_subtasks_offline.py \
 # --subtask-strategy pick_list
 # (stores `subtask` and full `subtask_sequence` per frame)
 ```
+
+OpenAI MLLM (new option):
+```
+python examples/subtasks/generate_subtasks_offline.py \
+  --backend openai \
+  --inputs-dir outputs/eval/<date>/<run>/inputs/subtask_inputs \
+  --output-dir outputs/eval/<date>/<run>/subtasks/gpt52 \
+  --model gpt-5.2 \
+  --openai-image-detail high \
+  --openai-reasoning-effort low \
+  --temperature 0.0 \
+  --max-new-tokens 16 \
+  --subtask-strategy completion_check
+```
+
+Notes:
+- `--backend` defaults to `hf`, so current VLM behavior stays the default.
+- For OpenAI backend, set `OPENAI_API_KEY` in your environment.
 
 ### Step 3: Annotate videos
 ```
@@ -122,10 +143,10 @@ python examples/subtasks/organize_run_outputs.py \
 - `outputs/eval/<date>/<run>/subtasks/<variant>/`
 - `outputs/logs/` (moved `nohup*.log`, `train_*.out`)
 
-## Dependencies (Offline VLM)
+## Dependencies (Offline Subtask Generation)
 Minimal requirements for the offline scripts are listed in `requirements.txt`:
 - `torch`, `torchvision`, `transformers`, `accelerate`
-- `pillow`, `imageio`, `qwen-vl-utils`
+- `pillow`, `imageio`, `qwen-vl-utils`, `openai`
 
 ## Notes
 - For Qwen3‑Thinking models, outputs are cleaned to keep only the final answer.
