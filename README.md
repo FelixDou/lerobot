@@ -152,6 +152,6 @@ Minimal requirements for the offline scripts are listed in `requirements.txt`:
 
 ## Notes
 - For Qwen3‑Thinking models, outputs are cleaned to keep only the final answer.
-- The completion check prompt now only uses the previous subtask (no full task).
+- In `completion_check`, the previous subtask is checked first and a new subtask is generated only if completion is `yes`.
 - `pick_list` generates a full list at t=0, then picks the current subtask from that fixed list at each step.
 - Use `subtask_inputs_stride` to reduce storage or speed up VLM runs.

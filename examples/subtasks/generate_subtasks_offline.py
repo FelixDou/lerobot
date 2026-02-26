@@ -612,25 +612,7 @@ def generate_subtasks_for_episode(
                 }
             )
         else:
-            prompt = _build_prompt(task_text, prev_subtask, model_name=model_name)
-            candidate = _generate_text(
-                model,
-                processor,
-                image,
-                prompt,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                disable_eos=disable_eos,
-                clean_output=clean_output,
-                backend=backend,
-                model_name=model_name,
-                openai_image_detail=openai_image_detail,
-                openai_reasoning_effort=openai_reasoning_effort,
-                debug_raw_output=debug_raw_output,
-                debug_label=f"step={frame.get('step')} kind=subtask_candidate",
-            )
-            final = candidate
+            final = prev_subtask
             if use_completion_check and prev_subtask:
                 completion_prompt = _build_completion_prompt(task_text, prev_subtask, model_name=model_name)
                 completed = _generate_text(
@@ -651,7 +633,36 @@ def generate_subtasks_for_episode(
                     debug_label=f"step={frame.get('step')} kind=completion_check",
                 )
                 if not completed.lower().startswith("y"):
-                    final = prev_subtask
+                    prev_subtask = final
+                    outputs.append(
+                        {
+                            "step": frame.get("step"),
+                            "image_key": chosen_key,
+                            "subtask": final,
+                        }
+                    )
+                    continue
+
+            prompt = _build_prompt(task_text, prev_subtask, model_name=model_name)
+            candidate = _generate_text(
+                model,
+                processor,
+                image,
+                prompt,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                disable_eos=disable_eos,
+                clean_output=clean_output,
+                backend=backend,
+                model_name=model_name,
+                openai_image_detail=openai_image_detail,
+                openai_reasoning_effort=openai_reasoning_effort,
+                debug_raw_output=debug_raw_output,
+                debug_label=f"step={frame.get('step')} kind=subtask_candidate",
+            )
+            if candidate:
+                final = candidate
             prev_subtask = final
             outputs.append(
                 {
