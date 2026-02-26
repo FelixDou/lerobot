@@ -115,12 +115,14 @@ python examples/subtasks/generate_subtasks_offline.py \
   --openai-reasoning-effort low \
   --temperature 0.0 \
   --max-new-tokens 16 \
+  --max-episodes-per-task 1 \
   --subtask-strategy completion_check
 ```
 
 Notes:
 - `--backend` defaults to `hf`, so current VLM behavior stays the default.
 - For OpenAI backend, set `OPENAI_API_KEY` in your environment.
+- For a low-cost smoke test, add `--max-episodes-per-task 1` to process one sample per task.
 
 ### Step 3: Annotate videos
 ```

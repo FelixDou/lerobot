@@ -24,6 +24,7 @@ Optional:
   --openai-reasoning-effort EFFORT (optional: none|minimal|low|medium|high|xhigh)
   --temperature T                (default: 0.0)
   --max-new-tokens N             (default: 16)
+  --max-episodes-per-task N      (default: all episodes in each task)
   --image-key KEY                (default: empty, auto-pick)
 EOF
 }
@@ -43,6 +44,7 @@ OPENAI_IMAGE_DETAIL="auto"
 OPENAI_REASONING_EFFORT=""
 TEMPERATURE="0.0"
 MAX_NEW_TOKENS="16"
+MAX_EPISODES_PER_TASK=""
 IMAGE_KEY=""
 
 while [[ $# -gt 0 ]]; do
@@ -62,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --openai-reasoning-effort) OPENAI_REASONING_EFFORT="$2"; shift 2;;
     --temperature) TEMPERATURE="$2"; shift 2;;
     --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2;;
+    --max-episodes-per-task) MAX_EPISODES_PER_TASK="$2"; shift 2;;
     --image-key) IMAGE_KEY="$2"; shift 2;;
     -h|--help) usage; exit 0;;
     *) echo "Unknown arg: $1"; usage; exit 1;;
@@ -122,6 +125,9 @@ if [[ "${BACKEND}" == "openai" ]]; then
 fi
 if [[ -n "${IMAGE_KEY}" ]]; then
   CMD+=(--image-key "${IMAGE_KEY}")
+fi
+if [[ -n "${MAX_EPISODES_PER_TASK}" ]]; then
+  CMD+=(--max-episodes-per-task "${MAX_EPISODES_PER_TASK}")
 fi
 
 "${CMD[@]}"

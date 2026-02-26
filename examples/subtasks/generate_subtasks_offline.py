@@ -631,6 +631,12 @@ def main() -> None:
     parser.add_argument("--openai-image-detail", choices=["auto", "low", "high"], default="auto")
     parser.add_argument("--openai-reasoning-effort", default=None)
     parser.add_argument("--image-key", default=None)
+    parser.add_argument(
+        "--max-episodes-per-task",
+        type=int,
+        default=None,
+        help="Limit how many episodes are processed per task directory (e.g., 1 for a low-cost smoke test).",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--no-max-new-tokens", action="store_true")
@@ -647,6 +653,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.subtask_strategy == "sequence_refinement":
         args.subtask_strategy = "pick_list"
+    if args.max_episodes_per_task is not None and args.max_episodes_per_task <= 0:
+        raise ValueError("--max-episodes-per-task must be >= 1 when provided.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model_name = args.model
@@ -711,6 +719,8 @@ def main() -> None:
                 metadata = json.load(f)
 
         episodes = sorted(task_dir.glob("episode_*.json"))
+        if args.max_episodes_per_task is not None:
+            episodes = episodes[: args.max_episodes_per_task]
         output_task_dir = args.output_dir / task_dir.name
         output_task_dir.mkdir(parents=True, exist_ok=True)
         if metadata:
