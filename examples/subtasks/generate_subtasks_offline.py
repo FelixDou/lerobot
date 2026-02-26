@@ -351,6 +351,10 @@ def _extract_openai_output_text(response) -> str:
     output_text = getattr(response, "output_text", None)
     if isinstance(output_text, str) and output_text.strip():
         return output_text.strip()
+    if isinstance(output_text, list):
+        chunks = [x for x in output_text if isinstance(x, str) and x.strip()]
+        if chunks:
+            return "\n".join(chunks).strip()
 
     def _get(obj, key):
         if isinstance(obj, dict):
@@ -366,8 +370,18 @@ def _extract_openai_output_text(response) -> str:
         for part in content:
             if _get(part, "type") == "output_text":
                 text = _get(part, "text")
-                if isinstance(text, str) and text:
-                    chunks.append(text)
+                if isinstance(text, str):
+                    if text:
+                        chunks.append(text)
+                    continue
+                if isinstance(text, dict):
+                    candidate = text.get("value") or text.get("text")
+                    if isinstance(candidate, str) and candidate:
+                        chunks.append(candidate)
+                    continue
+                candidate = getattr(text, "value", None) or getattr(text, "text", None)
+                if isinstance(candidate, str) and candidate:
+                    chunks.append(candidate)
 
     return "\n".join(chunks).strip()
 
@@ -395,6 +409,20 @@ def _generate_text(
             return
         print(f"\n[RAW_MODEL_OUTPUT] {debug_label}\n{raw_text}\n[/RAW_MODEL_OUTPUT]\n", file=sys.stderr)
 
+    def _emit_openai_response_debug(response_obj) -> None:
+        if not debug_raw_output:
+            return
+        try:
+            if hasattr(response_obj, "model_dump_json"):
+                payload = response_obj.model_dump_json(indent=2)
+            elif hasattr(response_obj, "to_dict"):
+                payload = json.dumps(response_obj.to_dict(), indent=2)
+            else:
+                payload = str(response_obj)
+        except Exception:
+            payload = repr(response_obj)
+        print(f"\n[RAW_OPENAI_RESPONSE] {debug_label}\n{payload}\n[/RAW_OPENAI_RESPONSE]\n", file=sys.stderr)
+
     if backend == "openai":
         image_url = _to_data_url(image)
         request = {
@@ -414,7 +442,8 @@ def _generate_text(
             ],
         }
         if max_new_tokens is not None:
-            request["max_output_tokens"] = max_new_tokens
+            # OpenAI Responses API requires max_output_tokens >= 16.
+            request["max_output_tokens"] = max(16, max_new_tokens)
         if temperature > 0:
             request["temperature"] = temperature
             request["top_p"] = 0.9
@@ -433,6 +462,7 @@ def _generate_text(
                     raise
                 time.sleep(1.5 * (attempt + 1))
 
+        _emit_openai_response_debug(response)
         generated_text = _extract_openai_output_text(response)
         _emit_debug(generated_text)
         if clean_output:
