@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import re
+import sys
 import time
 from collections import defaultdict
 from io import BytesIO
@@ -386,7 +387,14 @@ def _generate_text(
     model_name: str,
     openai_image_detail: str,
     openai_reasoning_effort: str | None,
+    debug_raw_output: bool,
+    debug_label: str,
 ):
+    def _emit_debug(raw_text: str) -> None:
+        if not debug_raw_output:
+            return
+        print(f"\n[RAW_MODEL_OUTPUT] {debug_label}\n{raw_text}\n[/RAW_MODEL_OUTPUT]\n", file=sys.stderr)
+
     if backend == "openai":
         image_url = _to_data_url(image)
         request = {
@@ -426,6 +434,7 @@ def _generate_text(
                 time.sleep(1.5 * (attempt + 1))
 
         generated_text = _extract_openai_output_text(response)
+        _emit_debug(generated_text)
         if clean_output:
             return _clean_response(generated_text)
         return generated_text.strip()
@@ -451,6 +460,7 @@ def _generate_text(
     input_len = inputs["input_ids"].shape[1]
     gen_ids = generated[0, input_len:]
     text = processor.tokenizer.decode(gen_ids, skip_special_tokens=True)
+    _emit_debug(text)
     if clean_output:
         return _clean_response(text)
     return text.strip()
@@ -502,6 +512,7 @@ def generate_subtasks_for_episode(
     backend: str,
     openai_image_detail: str,
     openai_reasoning_effort: str | None,
+    debug_raw_output: bool,
 ) -> dict:
     frames = episode_payload.get("frames", [])
     task_text = episode_payload.get("task", "")
@@ -527,6 +538,8 @@ def generate_subtasks_for_episode(
                     model_name=model_name,
                     openai_image_detail=openai_image_detail,
                     openai_reasoning_effort=openai_reasoning_effort,
+                    debug_raw_output=debug_raw_output,
+                    debug_label=f"step={frame.get('step')} kind=sequence",
                 )
                 fixed_sequence = _extract_subtask_sequence(sequence_text)
                 if not fixed_sequence:
@@ -553,6 +566,8 @@ def generate_subtasks_for_episode(
                 model_name=model_name,
                 openai_image_detail=openai_image_detail,
                 openai_reasoning_effort=openai_reasoning_effort,
+                debug_raw_output=debug_raw_output,
+                debug_label=f"step={frame.get('step')} kind=pick_list_choice",
             )
             final = _pick_subtask_from_sequence(choice, fixed_sequence)
             if not final:
@@ -582,6 +597,8 @@ def generate_subtasks_for_episode(
                 model_name=model_name,
                 openai_image_detail=openai_image_detail,
                 openai_reasoning_effort=openai_reasoning_effort,
+                debug_raw_output=debug_raw_output,
+                debug_label=f"step={frame.get('step')} kind=subtask_candidate",
             )
             final = candidate
             if use_completion_check and prev_subtask:
@@ -600,6 +617,8 @@ def generate_subtasks_for_episode(
                     model_name=model_name,
                     openai_image_detail=openai_image_detail,
                     openai_reasoning_effort=openai_reasoning_effort,
+                    debug_raw_output=debug_raw_output,
+                    debug_label=f"step={frame.get('step')} kind=completion_check",
                 )
                 if not completed.lower().startswith("y"):
                     final = prev_subtask
@@ -643,6 +662,11 @@ def main() -> None:
     parser.add_argument("--min-new-tokens", type=int, default=1)
     parser.add_argument("--disable-eos", action="store_true")
     parser.add_argument("--no-clean-output", action="store_true")
+    parser.add_argument(
+        "--debug-raw-output",
+        action="store_true",
+        help="Print raw model generations before any cleanup/parsing (to stderr).",
+    )
     parser.add_argument("--no-completion-check", action="store_true")
     parser.add_argument(
         "--subtask-strategy",
@@ -747,6 +771,7 @@ def main() -> None:
                 backend=args.backend,
                 openai_image_detail=args.openai_image_detail,
                 openai_reasoning_effort=args.openai_reasoning_effort,
+                debug_raw_output=args.debug_raw_output,
             )
             output_path = output_task_dir / episode_path.name
             with open(output_path, "w") as f:
