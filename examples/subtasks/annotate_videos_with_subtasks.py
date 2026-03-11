@@ -2,7 +2,9 @@
 
 import argparse
 import json
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import imageio
@@ -133,26 +135,33 @@ def _write_srt(steps: list[tuple[int, str]], fps: float, end_time_s: float, outp
 
 
 def _annotate_video(video_path: Path, srt_path: Path, output_path: Path, overwrite: bool) -> None:
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-    ]
-    if overwrite:
-        cmd.append("-y")
-    cmd.extend(
-        [
-            "-i",
-            str(video_path),
-            "-vf",
-            f"subtitles={srt_path}",
-            "-c:a",
-            "copy",
-            str(output_path),
+    # Some ffmpeg/libass builds fail to read subtitle files reliably from shared filesystems.
+    # Copy the subtitle file to local temp storage and escape the path for filter parsing.
+    with tempfile.TemporaryDirectory(prefix="lerobot_subtitles_") as tmpdir:
+        local_srt_path = Path(tmpdir) / srt_path.name
+        shutil.copy2(srt_path, local_srt_path)
+        subtitle_filter_path = str(local_srt_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", r"\'")
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
         ]
-    )
-    subprocess.run(cmd, check=True)
+        if overwrite:
+            cmd.append("-y")
+        cmd.extend(
+            [
+                "-i",
+                str(video_path),
+                "-vf",
+                f"subtitles='{subtitle_filter_path}'",
+                "-c:a",
+                "copy",
+                str(output_path),
+            ]
+        )
+        subprocess.run(cmd, check=True)
 
 
 def _iter_task_dirs(subtasks_root: Path) -> list[Path]:
