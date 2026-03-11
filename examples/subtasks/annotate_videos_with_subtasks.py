@@ -136,11 +136,11 @@ def _write_srt(steps: list[tuple[int, str]], fps: float, end_time_s: float, outp
 
 def _annotate_video(video_path: Path, srt_path: Path, output_path: Path, overwrite: bool) -> None:
     # Some ffmpeg/libass builds fail to read subtitle files reliably from shared filesystems.
-    # Copy the subtitle file to local temp storage and escape the path for filter parsing.
+    # Copy the subtitle file to local temp storage and run ffmpeg from that directory so the
+    # subtitles filter can open a simple basename instead of a long shared-filesystem path.
     with tempfile.TemporaryDirectory(prefix="lerobot_subtitles_") as tmpdir:
         local_srt_path = Path(tmpdir) / srt_path.name
         shutil.copy2(srt_path, local_srt_path)
-        subtitle_filter_path = str(local_srt_path).replace("\\", "\\\\").replace(":", "\\:").replace("'", r"\'")
 
         cmd = [
             "ffmpeg",
@@ -155,13 +155,13 @@ def _annotate_video(video_path: Path, srt_path: Path, output_path: Path, overwri
                 "-i",
                 str(video_path),
                 "-vf",
-                f"subtitles='{subtitle_filter_path}'",
+                f"subtitles={local_srt_path.name}",
                 "-c:a",
                 "copy",
                 str(output_path),
             ]
         )
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, cwd=tmpdir)
 
 
 def _iter_task_dirs(subtasks_root: Path) -> list[Path]:
