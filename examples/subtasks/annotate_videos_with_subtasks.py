@@ -127,9 +127,10 @@ def _write_srt(steps: list[tuple[int, str]], fps: float, end_time_s: float, outp
             end_s = steps[idx + 1][0] / fps
         else:
             end_s = end_time_s
+        cue_text = text if text.strip() else " "
         lines.append(str(idx + 1))
         lines.append(f"{_format_srt_time(start_s)} --> {_format_srt_time(end_s)}")
-        lines.append(text)
+        lines.append(cue_text)
         lines.append("")
     output_path.write_text("\n".join(lines))
 
@@ -153,7 +154,7 @@ def _load_srt_cues(srt_path: Path) -> list[tuple[float, float, str]]:
         start_raw, end_raw = [part.strip() for part in lines[timing_idx].split("-->", 1)]
         cue_text = "\n".join(lines[timing_idx + 1 :]).strip()
         if not cue_text:
-            continue
+            cue_text = " "
         cues.append((_parse_srt_time(start_raw), _parse_srt_time(end_raw), cue_text))
     return cues
 
