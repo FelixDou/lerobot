@@ -102,6 +102,9 @@ python examples/subtasks/generate_subtasks_offline.py \
 # Alternative strategy:
 # --subtask-strategy pick_list
 # (stores `subtask` and full `subtask_sequence` per frame)
+# GPT-5.2-friendly strategy:
+# --subtask-strategy pick_list_monotonic
+# (generates a fixed plan once, then tracks a monotonic step index)
 ```
 
 OpenAI MLLM (new option):
@@ -116,13 +119,14 @@ python examples/subtasks/generate_subtasks_offline.py \
   --temperature 0.0 \
   --max-new-tokens 16 \
   --max-episodes-per-task 1 \
-  --subtask-strategy completion_check
+  --subtask-strategy pick_list_monotonic
 ```
 
 Notes:
 - `--backend` defaults to `hf`, so current VLM behavior stays the default.
 - For OpenAI backend, set `OPENAI_API_KEY` in your environment.
 - For a low-cost smoke test, add `--max-episodes-per-task 1` to process one sample per task.
+- `pick_list_monotonic` is the recommended GPT-5.2 mode: it plans once, then tracks only the current step index with no backward jumps.
 
 ### Step 3: Annotate videos
 ```
@@ -154,4 +158,5 @@ Minimal requirements for the offline scripts are listed in `requirements.txt`:
 - For Qwen3‑Thinking models, outputs are cleaned to keep only the final answer.
 - In `completion_check`, the previous subtask is checked first and a new subtask is generated only if completion is `yes`.
 - `pick_list` generates a full list at t=0, then picks the current subtask from that fixed list at each step.
+- `pick_list_monotonic` generates a full list at t=0, then tracks a 1-based subtask index that can only stay the same or advance by one.
 - Use `subtask_inputs_stride` to reduce storage or speed up VLM runs.

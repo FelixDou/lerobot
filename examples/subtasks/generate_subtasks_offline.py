@@ -302,6 +302,38 @@ def _build_sequence_selection_prompt(task: str, sequence: list[str], *, model_na
     )
 
 
+def _build_monotonic_index_prompt(
+    task: str,
+    sequence: list[str],
+    prev_index: int | None,
+    *,
+    model_name: str,
+) -> str:
+    cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+    prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
+    if prev_index is None:
+        options = sequence
+        state_text = "No previous subtask index is available yet."
+    else:
+        options = [sequence[prev_index]]
+        if prev_index + 1 < len(sequence):
+            options.append(sequence[prev_index + 1])
+        state_text = f"Previous subtask index: {prev_index + 1} ({sequence[prev_index]})."
+    option_lines = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(options, start=prev_index or 0))
+    return (
+        f"{prefix}You are a robot. A fixed subtask sequence was generated at t=0.\n"
+        "From the current image, choose the ONE current subtask index from the fixed sequence.\n"
+        "Never go backward. Never skip ahead by more than one step.\n"
+        "Reply with only this XML tag: <index>N</index> where N is the chosen 1-based index.\n"
+        "\n"
+        f"Task: {cleaned_text}\n"
+        f"Fixed sequence: {' | '.join(f'{i + 1}. {step}' for i, step in enumerate(sequence))}\n"
+        f"{state_text}\n"
+        f"Allowed indices now:\n{option_lines}\n"
+        "Current subtask index: <index>"
+    )
+
+
 def _build_completion_prompt(task: str, prev_subtask: str, *, model_name: str) -> str:
     prev_text = prev_subtask.strip() if prev_subtask else "none"
     prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
@@ -412,16 +444,28 @@ def _generate_text(
     def _emit_openai_response_debug(response_obj) -> None:
         if not debug_raw_output:
             return
-        try:
-            if hasattr(response_obj, "model_dump_json"):
-                payload = response_obj.model_dump_json(indent=2)
-            elif hasattr(response_obj, "to_dict"):
-                payload = json.dumps(response_obj.to_dict(), indent=2)
-            else:
-                payload = str(response_obj)
-        except Exception:
-            payload = repr(response_obj)
-        print(f"\n[RAW_OPENAI_RESPONSE] {debug_label}\n{payload}\n[/RAW_OPENAI_RESPONSE]\n", file=sys.stderr)
+
+        def _get(obj, key, default=None):
+            if isinstance(obj, dict):
+                return obj.get(key, default)
+            return getattr(obj, key, default)
+
+        usage = _get(response_obj, "usage", {})
+        usage_out = _get(usage, "output_tokens_details", {})
+        summary = {
+            "id": _get(response_obj, "id"),
+            "model": _get(response_obj, "model"),
+            "status": _get(response_obj, "status"),
+            "input_tokens": _get(usage, "input_tokens"),
+            "output_tokens": _get(usage, "output_tokens"),
+            "reasoning_tokens": _get(usage_out, "reasoning_tokens"),
+            "error": _get(response_obj, "error"),
+            "incomplete_details": _get(response_obj, "incomplete_details"),
+        }
+        print(
+            f"\n[OPENAI_RESPONSE_SUMMARY] {debug_label}\n{json.dumps(summary, indent=2)}\n[/OPENAI_RESPONSE_SUMMARY]\n",
+            file=sys.stderr,
+        )
 
     if backend == "openai":
         image_url = _to_data_url(image)
@@ -524,6 +568,30 @@ def _pick_subtask_from_sequence(choice: str, sequence: list[str]) -> str:
     return ""
 
 
+def _extract_index_choice(text: str) -> int | None:
+    text = _strip_thinking(text).strip()
+    tagged = _extract_tag(text, "index")
+    candidate = tagged if tagged is not None else text
+    match = re.search(r"\d+", candidate)
+    if not match:
+        return None
+    return int(match.group(0)) - 1
+
+
+def _resolve_monotonic_index(choice_index: int | None, prev_index: int | None, sequence_length: int) -> int | None:
+    if sequence_length <= 0:
+        return None
+    if prev_index is None:
+        if choice_index is None:
+            return 0
+        return min(max(choice_index, 0), sequence_length - 1)
+    if choice_index is None:
+        return prev_index
+    if choice_index <= prev_index:
+        return prev_index
+    return min(prev_index + 1, sequence_length - 1)
+
+
 def generate_subtasks_for_episode(
     episode_payload: dict,
     *,
@@ -548,10 +616,11 @@ def generate_subtasks_for_episode(
     task_text = episode_payload.get("task", "")
     prev_subtask = ""
     fixed_sequence: list[str] = []
+    tracked_index: int | None = None
     outputs = []
     for frame in frames:
         image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
-        if strategy == "pick_list":
+        if strategy in {"pick_list", "pick_list_monotonic"}:
             if not fixed_sequence:
                 sequence_prompt = _build_sequence_prompt(task_text, model_name=model_name)
                 sequence_text = _generate_text(
@@ -577,40 +646,76 @@ def generate_subtasks_for_episode(
                     if fallback:
                         fixed_sequence = [fallback]
 
-            selection_prompt = _build_sequence_selection_prompt(
-                task_text,
-                fixed_sequence,
-                model_name=model_name,
-            )
-            choice = _generate_text(
-                model,
-                processor,
-                image,
-                selection_prompt,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=min_new_tokens,
-                disable_eos=disable_eos,
-                clean_output=True,
-                backend=backend,
-                model_name=model_name,
-                openai_image_detail=openai_image_detail,
-                openai_reasoning_effort=openai_reasoning_effort,
-                debug_raw_output=debug_raw_output,
-                debug_label=f"step={frame.get('step')} kind=pick_list_choice",
-            )
-            final = _pick_subtask_from_sequence(choice, fixed_sequence)
-            if not final:
-                final = prev_subtask if prev_subtask else (fixed_sequence[0] if fixed_sequence else choice)
+            if strategy == "pick_list_monotonic":
+                selection_prompt = _build_monotonic_index_prompt(
+                    task_text,
+                    fixed_sequence,
+                    tracked_index,
+                    model_name=model_name,
+                )
+                choice = _generate_text(
+                    model,
+                    processor,
+                    image,
+                    selection_prompt,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    disable_eos=disable_eos,
+                    clean_output=False,
+                    backend=backend,
+                    model_name=model_name,
+                    openai_image_detail=openai_image_detail,
+                    openai_reasoning_effort=openai_reasoning_effort,
+                    debug_raw_output=debug_raw_output,
+                    debug_label=f"step={frame.get('step')} kind=pick_list_monotonic_index",
+                )
+                tracked_index = _resolve_monotonic_index(
+                    _extract_index_choice(choice),
+                    tracked_index,
+                    len(fixed_sequence),
+                )
+                final = (
+                    fixed_sequence[tracked_index]
+                    if tracked_index is not None and fixed_sequence
+                    else prev_subtask if prev_subtask else ""
+                )
+            else:
+                selection_prompt = _build_sequence_selection_prompt(
+                    task_text,
+                    fixed_sequence,
+                    model_name=model_name,
+                )
+                choice = _generate_text(
+                    model,
+                    processor,
+                    image,
+                    selection_prompt,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    min_new_tokens=min_new_tokens,
+                    disable_eos=disable_eos,
+                    clean_output=True,
+                    backend=backend,
+                    model_name=model_name,
+                    openai_image_detail=openai_image_detail,
+                    openai_reasoning_effort=openai_reasoning_effort,
+                    debug_raw_output=debug_raw_output,
+                    debug_label=f"step={frame.get('step')} kind=pick_list_choice",
+                )
+                final = _pick_subtask_from_sequence(choice, fixed_sequence)
+                if not final:
+                    final = prev_subtask if prev_subtask else (fixed_sequence[0] if fixed_sequence else choice)
             prev_subtask = final
-            outputs.append(
-                {
-                    "step": frame.get("step"),
-                    "image_key": chosen_key,
-                    "subtask": final,
-                    "subtask_sequence": list(fixed_sequence),
-                }
-            )
+            record = {
+                "step": frame.get("step"),
+                "image_key": chosen_key,
+                "subtask": final,
+                "subtask_sequence": list(fixed_sequence),
+            }
+            if tracked_index is not None:
+                record["subtask_index"] = tracked_index + 1
+            outputs.append(record)
         else:
             final = prev_subtask
             if use_completion_check and prev_subtask:
@@ -711,9 +816,9 @@ def main() -> None:
     parser.add_argument("--no-completion-check", action="store_true")
     parser.add_argument(
         "--subtask-strategy",
-        choices=["completion_check", "pick_list", "sequence_refinement"],
+        choices=["completion_check", "pick_list", "pick_list_monotonic", "sequence_refinement"],
         default="completion_check",
-        help="Prompting strategy for subtask generation. Use `pick_list` (preferred).",
+        help="Prompting strategy for subtask generation. Use `pick_list_monotonic` for GPT-5.2.",
     )
     args = parser.parse_args()
     if args.subtask_strategy == "sequence_refinement":

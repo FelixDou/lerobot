@@ -24,6 +24,7 @@ Optional:
   --openai-reasoning-effort EFFORT (optional: none|minimal|low|medium|high|xhigh)
   --temperature T                (default: 0.0)
   --max-new-tokens N             (default: 16)
+  --subtask-strategy STRATEGY    (default: completion_check)
   --max-episodes-per-task N      (default: all episodes in each task)
   --image-key KEY                (default: empty, auto-pick)
 EOF
@@ -44,6 +45,7 @@ OPENAI_IMAGE_DETAIL="auto"
 OPENAI_REASONING_EFFORT=""
 TEMPERATURE="0.0"
 MAX_NEW_TOKENS="16"
+SUBTASK_STRATEGY="completion_check"
 MAX_EPISODES_PER_TASK=""
 IMAGE_KEY=""
 
@@ -64,6 +66,7 @@ while [[ $# -gt 0 ]]; do
     --openai-reasoning-effort) OPENAI_REASONING_EFFORT="$2"; shift 2;;
     --temperature) TEMPERATURE="$2"; shift 2;;
     --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2;;
+    --subtask-strategy) SUBTASK_STRATEGY="$2"; shift 2;;
     --max-episodes-per-task) MAX_EPISODES_PER_TASK="$2"; shift 2;;
     --image-key) IMAGE_KEY="$2"; shift 2;;
     -h|--help) usage; exit 0;;
@@ -116,6 +119,7 @@ CMD=(
   --dtype "${DTYPE}"
   --temperature "${TEMPERATURE}"
   --max-new-tokens "${MAX_NEW_TOKENS}"
+  --subtask-strategy "${SUBTASK_STRATEGY}"
 )
 if [[ "${BACKEND}" == "openai" ]]; then
   CMD+=(--openai-image-detail "${OPENAI_IMAGE_DETAIL}")
