@@ -134,34 +134,103 @@ def _write_srt(steps: list[tuple[int, str]], fps: float, end_time_s: float, outp
     output_path.write_text("\n".join(lines))
 
 
+def _parse_srt_time(value: str) -> float:
+    hhmmss, millis = value.strip().split(",", 1)
+    hours, minutes, seconds = hhmmss.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + int(seconds) + int(millis) / 1000.0
+
+
+def _load_srt_cues(srt_path: Path) -> list[tuple[float, float, str]]:
+    text = srt_path.read_text()
+    cues = []
+    for block in text.split("\n\n"):
+        lines = [line for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        timing_idx = next((i for i, line in enumerate(lines) if "-->" in line), None)
+        if timing_idx is None:
+            continue
+        start_raw, end_raw = [part.strip() for part in lines[timing_idx].split("-->", 1)]
+        cue_text = "\n".join(lines[timing_idx + 1 :]).strip()
+        if not cue_text:
+            continue
+        cues.append((_parse_srt_time(start_raw), _parse_srt_time(end_raw), cue_text))
+    return cues
+
+
+def _build_drawtext_filter(cues: list[tuple[float, float, str]], tmpdir: str) -> str:
+    filters = []
+    for idx, (start_s, end_s, cue_text) in enumerate(cues):
+        textfile = Path(tmpdir) / f"cue_{idx:04d}.txt"
+        textfile.write_text(cue_text)
+        filters.append(
+            "drawtext="
+            f"textfile={textfile.name}:"
+            "reload=0:"
+            "fontcolor=white:"
+            "fontsize=26:"
+            "borderw=2:"
+            "bordercolor=black:"
+            "box=1:"
+            "boxcolor=black@0.45:"
+            "boxborderw=10:"
+            "x=(w-text_w)/2:"
+            "y=h-text_h-40:"
+            f"enable='between(t,{start_s:.3f},{end_s:.3f})'"
+        )
+    return ",".join(filters)
+
+
+def _annotate_video_with_filter(video_path: Path, filter_expr: str, output_path: Path, overwrite: bool, *, cwd: str | None = None) -> None:
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+    ]
+    if overwrite:
+        cmd.append("-y")
+    cmd.extend(
+        [
+            "-i",
+            str(video_path),
+            "-vf",
+            filter_expr,
+            "-c:a",
+            "copy",
+            str(output_path),
+        ]
+    )
+    subprocess.run(cmd, check=True, cwd=cwd)
+
+
 def _annotate_video(video_path: Path, srt_path: Path, output_path: Path, overwrite: bool) -> None:
-    # Some ffmpeg/libass builds fail to read subtitle files reliably from shared filesystems.
-    # Copy the subtitle file to local temp storage and run ffmpeg from that directory so the
-    # subtitles filter can open a simple basename instead of a long shared-filesystem path.
+    # Prefer ffmpeg's subtitle renderer when available, but fall back to drawtext on clusters
+    # where the subtitles/libass path is unreliable.
     with tempfile.TemporaryDirectory(prefix="lerobot_subtitles_") as tmpdir:
         local_srt_path = Path(tmpdir) / srt_path.name
         shutil.copy2(srt_path, local_srt_path)
-
-        cmd = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-        ]
-        if overwrite:
-            cmd.append("-y")
-        cmd.extend(
-            [
-                "-i",
-                str(video_path),
-                "-vf",
+        try:
+            _annotate_video_with_filter(
+                video_path,
                 f"subtitles={local_srt_path.name}",
-                "-c:a",
-                "copy",
-                str(output_path),
-            ]
-        )
-        subprocess.run(cmd, check=True, cwd=tmpdir)
+                output_path,
+                overwrite,
+                cwd=tmpdir,
+            )
+            return
+        except subprocess.CalledProcessError:
+            cues = _load_srt_cues(local_srt_path)
+            if not cues:
+                raise
+            drawtext_filter = _build_drawtext_filter(cues, tmpdir)
+            _annotate_video_with_filter(
+                video_path,
+                drawtext_filter,
+                output_path,
+                overwrite,
+                cwd=tmpdir,
+            )
 
 
 def _iter_task_dirs(subtasks_root: Path) -> list[Path]:
