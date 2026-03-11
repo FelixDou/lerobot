@@ -345,6 +345,30 @@ def _build_completion_prompt(task: str, prev_subtask: str, *, model_name: str) -
     )
 
 
+def _build_binary_advance_prompt(
+    task: str,
+    sequence: list[str],
+    current_index: int,
+    *,
+    model_name: str,
+) -> str:
+    cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+    prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
+    current_step = sequence[current_index]
+    next_step = sequence[current_index + 1] if current_index + 1 < len(sequence) else "done"
+    return (
+        f"{prefix}You are a robot. A fixed subtask sequence was generated at t=0.\n"
+        "Decide whether the CURRENT subtask is already completed in this image.\n"
+        "Reply with only one word: yes or no.\n"
+        "\n"
+        f"Task: {cleaned_text}\n"
+        f"Current subtask index: {current_index + 1}\n"
+        f"Current subtask: {current_step}\n"
+        f"Next subtask if completed: {next_step}\n"
+        "Completed:"
+    )
+
+
 def _select_image(frame: dict, image_key: str | None, *, base_dir: Path) -> tuple[Image.Image, str]:
     images = frame.get("images", {})
     if not images:
@@ -620,7 +644,7 @@ def generate_subtasks_for_episode(
     outputs = []
     for frame in frames:
         image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
-        if strategy in {"pick_list", "pick_list_monotonic"}:
+        if strategy in {"pick_list", "pick_list_monotonic", "plan_once_binary_advance"}:
             if not fixed_sequence:
                 sequence_prompt = _build_sequence_prompt(task_text, model_name=model_name)
                 sequence_text = _generate_text(
@@ -646,7 +670,41 @@ def generate_subtasks_for_episode(
                     if fallback:
                         fixed_sequence = [fallback]
 
-            if strategy == "pick_list_monotonic":
+            if strategy == "plan_once_binary_advance":
+                if tracked_index is None:
+                    tracked_index = 0 if fixed_sequence else None
+                elif tracked_index < len(fixed_sequence) - 1:
+                    advance_prompt = _build_binary_advance_prompt(
+                        task_text,
+                        fixed_sequence,
+                        tracked_index,
+                        model_name=model_name,
+                    )
+                    completed = _generate_text(
+                        model,
+                        processor,
+                        image,
+                        advance_prompt,
+                        temperature=0.0,
+                        max_new_tokens=3,
+                        min_new_tokens=1,
+                        disable_eos=False,
+                        clean_output=True,
+                        backend=backend,
+                        model_name=model_name,
+                        openai_image_detail=openai_image_detail,
+                        openai_reasoning_effort=openai_reasoning_effort,
+                        debug_raw_output=debug_raw_output,
+                        debug_label=f"step={frame.get('step')} kind=plan_once_binary_advance",
+                    )
+                    if completed.lower().startswith("y"):
+                        tracked_index = min(tracked_index + 1, len(fixed_sequence) - 1)
+                final = (
+                    fixed_sequence[tracked_index]
+                    if tracked_index is not None and fixed_sequence
+                    else prev_subtask if prev_subtask else ""
+                )
+            elif strategy == "pick_list_monotonic":
                 selection_prompt = _build_monotonic_index_prompt(
                     task_text,
                     fixed_sequence,
@@ -816,9 +874,15 @@ def main() -> None:
     parser.add_argument("--no-completion-check", action="store_true")
     parser.add_argument(
         "--subtask-strategy",
-        choices=["completion_check", "pick_list", "pick_list_monotonic", "sequence_refinement"],
+        choices=[
+            "completion_check",
+            "pick_list",
+            "pick_list_monotonic",
+            "plan_once_binary_advance",
+            "sequence_refinement",
+        ],
         default="completion_check",
-        help="Prompting strategy for subtask generation. Use `pick_list_monotonic` for GPT-5.2.",
+        help="Prompting strategy for subtask generation. Use `pick_list_monotonic` or `plan_once_binary_advance` for GPT-5.2.",
     )
     args = parser.parse_args()
     if args.subtask_strategy == "sequence_refinement":

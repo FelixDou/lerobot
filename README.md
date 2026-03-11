@@ -105,6 +105,9 @@ python examples/subtasks/generate_subtasks_offline.py \
 # GPT-5.2-friendly strategy:
 # --subtask-strategy pick_list_monotonic
 # (generates a fixed plan once, then tracks a monotonic step index)
+# Binary transition baseline:
+# --subtask-strategy plan_once_binary_advance
+# (generates a fixed plan once, then asks only yes/no to advance)
 ```
 
 OpenAI MLLM (new option):
@@ -127,6 +130,7 @@ Notes:
 - For OpenAI backend, set `OPENAI_API_KEY` in your environment.
 - For a low-cost smoke test, add `--max-episodes-per-task 1` to process one sample per task.
 - `pick_list_monotonic` is the recommended GPT-5.2 mode: it plans once, then tracks only the current step index with no backward jumps.
+- `plan_once_binary_advance` is a simpler comparison baseline: it plans once, then makes only a binary advance/no-advance decision per frame.
 
 ### Step 3: Annotate videos
 ```
@@ -159,4 +163,5 @@ Minimal requirements for the offline scripts are listed in `requirements.txt`:
 - In `completion_check`, the previous subtask is checked first and a new subtask is generated only if completion is `yes`.
 - `pick_list` generates a full list at t=0, then picks the current subtask from that fixed list at each step.
 - `pick_list_monotonic` generates a full list at t=0, then tracks a 1-based subtask index that can only stay the same or advance by one.
+- `plan_once_binary_advance` generates a full list at t=0, then keeps the current step unless the model answers `yes` to a binary completion check for that step.
 - Use `subtask_inputs_stride` to reduce storage or speed up VLM runs.
