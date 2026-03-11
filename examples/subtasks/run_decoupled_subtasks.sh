@@ -25,6 +25,7 @@ Optional:
   --temperature T                (default: 0.0)
   --max-new-tokens N             (default: 16)
   --subtask-strategy STRATEGY    (default: completion_check)
+  --global-alignment-num-anchors N (default: 8; only for plan_once_global_alignment)
   --max-episodes-per-task N      (default: all episodes in each task)
   --image-key KEY                (default: empty, auto-pick)
 EOF
@@ -46,6 +47,7 @@ OPENAI_REASONING_EFFORT=""
 TEMPERATURE="0.0"
 MAX_NEW_TOKENS="16"
 SUBTASK_STRATEGY="completion_check"
+GLOBAL_ALIGNMENT_NUM_ANCHORS="8"
 MAX_EPISODES_PER_TASK=""
 IMAGE_KEY=""
 
@@ -67,6 +69,7 @@ while [[ $# -gt 0 ]]; do
     --temperature) TEMPERATURE="$2"; shift 2;;
     --max-new-tokens) MAX_NEW_TOKENS="$2"; shift 2;;
     --subtask-strategy) SUBTASK_STRATEGY="$2"; shift 2;;
+    --global-alignment-num-anchors) GLOBAL_ALIGNMENT_NUM_ANCHORS="$2"; shift 2;;
     --max-episodes-per-task) MAX_EPISODES_PER_TASK="$2"; shift 2;;
     --image-key) IMAGE_KEY="$2"; shift 2;;
     -h|--help) usage; exit 0;;
@@ -121,6 +124,9 @@ CMD=(
   --max-new-tokens "${MAX_NEW_TOKENS}"
   --subtask-strategy "${SUBTASK_STRATEGY}"
 )
+if [[ "${SUBTASK_STRATEGY}" == "plan_once_global_alignment" ]]; then
+  CMD+=(--global-alignment-num-anchors "${GLOBAL_ALIGNMENT_NUM_ANCHORS}")
+fi
 if [[ "${BACKEND}" == "openai" ]]; then
   CMD+=(--openai-image-detail "${OPENAI_IMAGE_DETAIL}")
   if [[ -n "${OPENAI_REASONING_EFFORT}" ]]; then

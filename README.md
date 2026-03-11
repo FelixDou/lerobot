@@ -108,6 +108,9 @@ python examples/subtasks/generate_subtasks_offline.py \
 # Binary transition baseline:
 # --subtask-strategy plan_once_binary_advance
 # (generates a fixed plan once, then asks only yes/no to advance)
+# Global alignment baseline:
+# --subtask-strategy plan_once_global_alignment
+# (generates a fixed plan once, scores anchor frames, then globally aligns)
 ```
 
 OpenAI MLLM (new option):
@@ -123,6 +126,10 @@ python examples/subtasks/generate_subtasks_offline.py \
   --max-new-tokens 16 \
   --max-episodes-per-task 1 \
   --subtask-strategy pick_list_monotonic
+
+# Alternative offline baseline:
+# --subtask-strategy plan_once_global_alignment
+# --global-alignment-num-anchors 8
 ```
 
 Notes:
@@ -131,6 +138,7 @@ Notes:
 - For a low-cost smoke test, add `--max-episodes-per-task 1` to process one sample per task.
 - `pick_list_monotonic` is the recommended GPT-5.2 mode: it plans once, then tracks only the current step index with no backward jumps.
 - `plan_once_binary_advance` is a simpler comparison baseline: it plans once, then makes only a binary advance/no-advance decision per frame.
+- `plan_once_global_alignment` is a trajectory-level baseline: it plans once, scores a sparse set of anchor frames, then fits a globally monotonic timeline.
 
 ### Step 3: Annotate videos
 ```
@@ -164,4 +172,5 @@ Minimal requirements for the offline scripts are listed in `requirements.txt`:
 - `pick_list` generates a full list at t=0, then picks the current subtask from that fixed list at each step.
 - `pick_list_monotonic` generates a full list at t=0, then tracks a 1-based subtask index that can only stay the same or advance by one.
 - `plan_once_binary_advance` generates a full list at t=0, then keeps the current step unless the model answers `yes` to a binary completion check for that step.
+- `plan_once_global_alignment` generates a full list at t=0, predicts subtask indices only on sparse anchor frames, then uses monotonic global alignment and interpolation to label the full trajectory.
 - Use `subtask_inputs_stride` to reduce storage or speed up VLM runs.

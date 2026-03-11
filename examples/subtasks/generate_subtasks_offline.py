@@ -334,6 +334,26 @@ def _build_monotonic_index_prompt(
     )
 
 
+def _build_global_alignment_prompt(
+    task: str,
+    sequence: list[str],
+    *,
+    model_name: str,
+) -> str:
+    cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+    prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
+    sequence_text = " | ".join(f"{i + 1}. {step}" for i, step in enumerate(sequence))
+    return (
+        f"{prefix}You are a robot. A fixed ordered subtask sequence was generated at t=0.\n"
+        "From the current image, choose the ONE subtask index that best matches the robot's current progress.\n"
+        "Reply with only this XML tag: <index>N</index> where N is the chosen 1-based index.\n"
+        "\n"
+        f"Task: {cleaned_text}\n"
+        f"Fixed sequence: {sequence_text}\n"
+        "Best matching subtask index: <index>"
+    )
+
+
 def _build_completion_prompt(task: str, prev_subtask: str, *, model_name: str) -> str:
     prev_text = prev_subtask.strip() if prev_subtask else "none"
     prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
@@ -616,6 +636,95 @@ def _resolve_monotonic_index(choice_index: int | None, prev_index: int | None, s
     return min(prev_index + 1, sequence_length - 1)
 
 
+def _sample_anchor_indices(num_frames: int, num_anchors: int) -> list[int]:
+    if num_frames <= 0:
+        return []
+    if num_anchors <= 1 or num_frames == 1:
+        return [0]
+    count = min(num_frames, num_anchors)
+    if count == num_frames:
+        return list(range(num_frames))
+    indices = []
+    for i in range(count):
+        idx = round(i * (num_frames - 1) / (count - 1))
+        if not indices or idx != indices[-1]:
+            indices.append(idx)
+    if indices[-1] != num_frames - 1:
+        indices.append(num_frames - 1)
+    return indices
+
+
+def _align_anchor_indices(observed: list[int | None], sequence_length: int) -> list[int]:
+    if sequence_length <= 0 or not observed:
+        return []
+    penalty_same = 0.0
+    penalty_step = 0.25
+    penalty_jump = 1.0
+    mismatch_scale = 1.5
+    dp: list[list[float]] = [[float("inf")] * sequence_length for _ in observed]
+    backpointers: list[list[int | None]] = [[None] * sequence_length for _ in observed]
+
+    def emission_cost(state: int, obs: int | None) -> float:
+        if obs is None:
+            return 0.0
+        return abs(state - obs) * mismatch_scale
+
+    for state in range(sequence_length):
+        dp[0][state] = emission_cost(state, observed[0])
+
+    for t in range(1, len(observed)):
+        for state in range(sequence_length):
+            emit = emission_cost(state, observed[t])
+            best_cost = float("inf")
+            best_prev = None
+            for prev_state in range(state + 1):
+                delta = state - prev_state
+                if delta == 0:
+                    transition = penalty_same
+                elif delta == 1:
+                    transition = penalty_step
+                else:
+                    transition = penalty_jump * delta
+                candidate = dp[t - 1][prev_state] + transition + emit
+                if candidate < best_cost:
+                    best_cost = candidate
+                    best_prev = prev_state
+            dp[t][state] = best_cost
+            backpointers[t][state] = best_prev
+
+    end_state = min(range(sequence_length), key=lambda state: dp[-1][state])
+    aligned = [end_state]
+    for t in range(len(observed) - 1, 0, -1):
+        prev_state = backpointers[t][aligned[-1]]
+        aligned.append(0 if prev_state is None else prev_state)
+    aligned.reverse()
+    return aligned
+
+
+def _expand_anchor_path(anchor_indices: list[int], anchor_states: list[int], num_frames: int) -> list[int]:
+    if num_frames <= 0:
+        return []
+    if not anchor_indices or not anchor_states:
+        return [0] * num_frames
+    expanded = [anchor_states[0]] * num_frames
+    for anchor_pos, state in zip(anchor_indices, anchor_states):
+        expanded[anchor_pos] = state
+    for segment_idx in range(len(anchor_indices) - 1):
+        start = anchor_indices[segment_idx]
+        end = anchor_indices[segment_idx + 1]
+        start_state = anchor_states[segment_idx]
+        end_state = anchor_states[segment_idx + 1]
+        span = end - start
+        if span <= 0:
+            continue
+        delta = end_state - start_state
+        for offset in range(span + 1):
+            expanded[start + offset] = start_state + ((offset * delta) // span)
+    for frame_idx in range(anchor_indices[-1], num_frames):
+        expanded[frame_idx] = anchor_states[-1]
+    return expanded
+
+
 def generate_subtasks_for_episode(
     episode_payload: dict,
     *,
@@ -635,6 +744,7 @@ def generate_subtasks_for_episode(
     openai_image_detail: str,
     openai_reasoning_effort: str | None,
     debug_raw_output: bool,
+    global_alignment_num_anchors: int,
 ) -> dict:
     frames = episode_payload.get("frames", [])
     task_text = episode_payload.get("task", "")
@@ -644,7 +754,7 @@ def generate_subtasks_for_episode(
     outputs = []
     for frame in frames:
         image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
-        if strategy in {"pick_list", "pick_list_monotonic", "plan_once_binary_advance"}:
+        if strategy in {"pick_list", "pick_list_monotonic", "plan_once_binary_advance", "plan_once_global_alignment"}:
             if not fixed_sequence:
                 sequence_prompt = _build_sequence_prompt(task_text, model_name=model_name)
                 sequence_text = _generate_text(
@@ -670,6 +780,8 @@ def generate_subtasks_for_episode(
                     if fallback:
                         fixed_sequence = [fallback]
 
+            if strategy == "plan_once_global_alignment":
+                break
             if strategy == "plan_once_binary_advance":
                 if tracked_index is None:
                     tracked_index = 0 if fixed_sequence else None
@@ -835,6 +947,56 @@ def generate_subtasks_for_episode(
                 }
             )
     episode_payload["subtasks"] = outputs
+    if strategy == "plan_once_global_alignment":
+        anchor_indices = _sample_anchor_indices(len(frames), global_alignment_num_anchors)
+        alignment_prompt = _build_global_alignment_prompt(task_text, fixed_sequence, model_name=model_name)
+        observed_indices: list[int | None] = []
+        for anchor_idx in anchor_indices:
+            frame = frames[anchor_idx]
+            image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
+            choice = _generate_text(
+                model,
+                processor,
+                image,
+                alignment_prompt,
+                temperature=temperature,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                disable_eos=disable_eos,
+                clean_output=False,
+                backend=backend,
+                model_name=model_name,
+                openai_image_detail=openai_image_detail,
+                openai_reasoning_effort=openai_reasoning_effort,
+                debug_raw_output=debug_raw_output,
+                debug_label=f"step={frame.get('step')} kind=plan_once_global_alignment_anchor",
+            )
+            observed_indices.append(_extract_index_choice(choice))
+
+        aligned_anchor_states = _align_anchor_indices(observed_indices, len(fixed_sequence))
+        full_path = _expand_anchor_path(anchor_indices, aligned_anchor_states, len(frames))
+        outputs = []
+        for frame_idx, frame in enumerate(frames):
+            image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
+            state = full_path[frame_idx] if frame_idx < len(full_path) else 0
+            state = min(max(state, 0), max(len(fixed_sequence) - 1, 0))
+            subtask = fixed_sequence[state] if fixed_sequence else ""
+            outputs.append(
+                {
+                    "step": frame.get("step"),
+                    "image_key": chosen_key,
+                    "subtask": subtask,
+                    "subtask_index": state + 1 if fixed_sequence else None,
+                    "subtask_sequence": list(fixed_sequence),
+                }
+            )
+        episode_payload["subtasks"] = outputs
+        episode_payload["global_alignment_anchor_steps"] = [
+            frames[idx].get("step") for idx in anchor_indices
+        ]
+        episode_payload["global_alignment_anchor_indices"] = [
+            state + 1 for state in aligned_anchor_states
+        ]
     return episode_payload
 
 
@@ -879,16 +1041,25 @@ def main() -> None:
             "pick_list",
             "pick_list_monotonic",
             "plan_once_binary_advance",
+            "plan_once_global_alignment",
             "sequence_refinement",
         ],
         default="completion_check",
-        help="Prompting strategy for subtask generation. Use `pick_list_monotonic` or `plan_once_binary_advance` for GPT-5.2.",
+        help="Prompting strategy for subtask generation. Use `pick_list_monotonic`, `plan_once_binary_advance`, or `plan_once_global_alignment` for GPT-5.2.",
+    )
+    parser.add_argument(
+        "--global-alignment-num-anchors",
+        type=int,
+        default=8,
+        help="Number of anchor frames to score when using `plan_once_global_alignment`.",
     )
     args = parser.parse_args()
     if args.subtask_strategy == "sequence_refinement":
         args.subtask_strategy = "pick_list"
     if args.max_episodes_per_task is not None and args.max_episodes_per_task <= 0:
         raise ValueError("--max-episodes-per-task must be >= 1 when provided.")
+    if args.global_alignment_num_anchors <= 0:
+        raise ValueError("--global-alignment-num-anchors must be >= 1.")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     model_name = args.model
@@ -982,6 +1153,7 @@ def main() -> None:
                 openai_image_detail=args.openai_image_detail,
                 openai_reasoning_effort=args.openai_reasoning_effort,
                 debug_raw_output=args.debug_raw_output,
+                global_alignment_num_anchors=args.global_alignment_num_anchors,
             )
             output_path = output_task_dir / episode_path.name
             with open(output_path, "w") as f:
