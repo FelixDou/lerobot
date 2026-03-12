@@ -338,18 +338,37 @@ def _build_global_alignment_prompt(
     task: str,
     sequence: list[str],
     *,
+    frame_index: int,
+    total_frames: int,
+    prev_index: int | None,
     model_name: str,
 ) -> str:
     cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
     prefix = "<image>\n" if "qwen3-vl" in model_name.lower() else ""
-    sequence_text = " | ".join(f"{i + 1}. {step}" for i, step in enumerate(sequence))
+    if prev_index is None:
+        allowed_start = 0
+        progress_text = "No previous anchor prediction is available yet."
+    else:
+        allowed_start = min(max(prev_index, 0), max(len(sequence) - 1, 0))
+        progress_text = (
+            f"Previous anchor subtask index: {allowed_start + 1} ({sequence[allowed_start]}).\n"
+            "At this later frame, do not go backward."
+        )
+    allowed_options = sequence[allowed_start:]
+    option_lines = "\n".join(
+        f"{i + 1}. {step}" for i, step in enumerate(allowed_options, start=allowed_start)
+    )
     return (
         f"{prefix}You are a robot. A fixed ordered subtask sequence was generated at t=0.\n"
         "From the current image, choose the ONE subtask index that best matches the robot's current progress.\n"
+        "The anchor frames are processed in chronological order, so progress should stay the same or move forward.\n"
         "Reply with only this XML tag: <index>N</index> where N is the chosen 1-based index.\n"
         "\n"
         f"Task: {cleaned_text}\n"
-        f"Fixed sequence: {sequence_text}\n"
+        f"Current frame: {frame_index + 1}/{total_frames}\n"
+        f"{progress_text}\n"
+        f"Fixed sequence: {' | '.join(f'{i + 1}. {step}' for i, step in enumerate(sequence))}\n"
+        f"Allowed indices now:\n{option_lines}\n"
         "Best matching subtask index: <index>"
     )
 
@@ -949,11 +968,19 @@ def generate_subtasks_for_episode(
     episode_payload["subtasks"] = outputs
     if strategy == "plan_once_global_alignment":
         anchor_indices = _sample_anchor_indices(len(frames), global_alignment_num_anchors)
-        alignment_prompt = _build_global_alignment_prompt(task_text, fixed_sequence, model_name=model_name)
         observed_indices: list[int | None] = []
         for anchor_idx in anchor_indices:
             frame = frames[anchor_idx]
             image, chosen_key = _select_image(frame, image_key, base_dir=base_dir)
+            prev_observed = observed_indices[-1] if observed_indices else None
+            alignment_prompt = _build_global_alignment_prompt(
+                task_text,
+                fixed_sequence,
+                frame_index=anchor_idx,
+                total_frames=len(frames),
+                prev_index=prev_observed,
+                model_name=model_name,
+            )
             choice = _generate_text(
                 model,
                 processor,
@@ -971,7 +998,10 @@ def generate_subtasks_for_episode(
                 debug_raw_output=debug_raw_output,
                 debug_label=f"step={frame.get('step')} kind=plan_once_global_alignment_anchor",
             )
-            observed_indices.append(_extract_index_choice(choice))
+            choice_index = _extract_index_choice(choice)
+            if prev_observed is not None and choice_index is not None:
+                choice_index = max(choice_index, prev_observed)
+            observed_indices.append(choice_index)
 
         aligned_anchor_states = _align_anchor_indices(observed_indices, len(fixed_sequence))
         full_path = _expand_anchor_path(anchor_indices, aligned_anchor_states, len(frames))
